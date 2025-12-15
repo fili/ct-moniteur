@@ -803,6 +803,8 @@ class CTMoniteur:
         max_keepalive_connections: int = 20,
         include_logs: Optional[List[str]] = None,
         exclude_logs: Optional[List[str]] = None,
+        shard_id: Optional[int] = None,
+        total_shards: Optional[int] = None,
     ):
         """
         Initialize CT Moniteur.
@@ -821,6 +823,8 @@ class CTMoniteur:
             max_keepalive_connections: Max keepalive connections in pool
             include_logs: Only monitor logs matching these patterns (partial URL match)
             exclude_logs: Skip logs matching these patterns (partial URL match)
+            shard_id: This instance's shard ID (0 to total_shards-1)
+            total_shards: Total number of shards for distributed processing
         """
         self.callback = callback
         self.skip_retired = skip_retired
@@ -832,6 +836,8 @@ class CTMoniteur:
         self.refresh_interval = refresh_interval
         self.include_logs = include_logs
         self.exclude_logs = exclude_logs
+        self.shard_id = shard_id
+        self.total_shards = total_shards
 
         self._state: Dict[str, int] = initial_state or {}
         self._clients: List[Union[TiledLogClient, ClassicLogClient]] = []
@@ -907,12 +913,18 @@ class CTMoniteur:
         return self._stats
 
     def _should_include_log(self, url: str) -> bool:
-        """Check if log URL should be included based on filters."""
+        """Check if log URL should be included based on filters and sharding."""
+        # Check include/exclude patterns first
         if self.include_logs:
             if not any(pattern in url for pattern in self.include_logs):
                 return False
         if self.exclude_logs:
             if any(pattern in url for pattern in self.exclude_logs):
+                return False
+        # Check sharding
+        if self.shard_id is not None and self.total_shards is not None:
+            url_hash = hash(url) % self.total_shards
+            if url_hash != self.shard_id:
                 return False
         return True
 
