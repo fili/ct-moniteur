@@ -8,6 +8,7 @@ import base64
 import hashlib
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
@@ -116,6 +117,7 @@ class TiledLogClient:
 
     DEFAULT_USER_AGENT = f"CT-Moniteur/{__version__}"
     TILE_SIZE = 256
+    PARSE_BATCH_SIZE = 256  # Parse this many entries in parallel
 
     def __init__(
         self,
@@ -124,17 +126,31 @@ class TiledLogClient:
         user_agent: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         shard_id: Optional[int] = None,
+        executor: Optional[ThreadPoolExecutor] = None,
     ):
         self.log_meta = log_meta
         self.timeout = timeout
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
         self.shard_id = shard_id
+        self._executor = executor
         self._client = httpx.AsyncClient(
             base_url=log_meta.url,
             timeout=self.timeout,
             headers={"User-Agent": self.user_agent},
             transport=transport or RateLimitedTransport(),
         )
+
+    def _get_group_prefix(self) -> str:
+        """Get group-aware prefix based on log URL."""
+        if self.shard_id is None:
+            return ""
+        url = self.log_meta.url
+        if "googleapis.com" in url:
+            return f"google{self.shard_id}:"
+        elif "trustasia.com" in url:
+            return f"trustasia{self.shard_id}:"
+        else:
+            return f"shard{self.shard_id}:"
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -383,15 +399,66 @@ class TiledLogClient:
         Yields:
             CertificateEntry objects for new entries
         """
+        batch: List[tuple[int, LogEntry]] = []
+
         async for entry_index, leaf in self.fetch_entries_raw(start_index):
+            batch.append((entry_index, leaf))
+
+            if len(batch) >= self.PARSE_BATCH_SIZE:
+                async for entry in self._parse_batch(batch):
+                    yield entry
+                batch = []
+
+        # Process remaining entries
+        if batch:
+            async for entry in self._parse_batch(batch):
+                yield entry
+
+    async def _parse_batch(
+        self, batch: List[tuple[int, LogEntry]]
+    ) -> AsyncIterator[CertificateEntry]:
+        """Parse a batch of entries in parallel using thread pool."""
+        if not batch:
+            return
+
+        if self._executor is None:
+            # Fallback to sequential parsing
+            for entry_index, leaf in batch:
+                try:
+                    source = EntrySource(index=entry_index, log=self.log_meta)
+                    entry = CertificateParser.parse_log_entry(leaf, source)
+                    yield entry
+                except Exception as e:
+                    logger.warning(
+                        f"Error parsing tiled entry {entry_index} from {self.log_meta.url}: {e}"
+                    )
+            return
+
+        loop = asyncio.get_running_loop()
+
+        def parse_one(item: tuple[int, LogEntry]) -> Optional[CertificateEntry]:
+            entry_index, leaf = item
             try:
                 source = EntrySource(index=entry_index, log=self.log_meta)
-                entry = CertificateParser.parse_log_entry(leaf, source)
-                yield entry
+                return CertificateParser.parse_log_entry(leaf, source)
             except Exception as e:
                 logger.warning(
                     f"Error parsing tiled entry {entry_index} from {self.log_meta.url}: {e}"
                 )
+                return None
+
+        # Submit all parse tasks to thread pool
+        futures = [
+            loop.run_in_executor(self._executor, parse_one, item)
+            for item in batch
+        ]
+
+        # Gather results preserving order
+        results = await asyncio.gather(*futures)
+
+        for entry in results:
+            if entry is not None:
+                yield entry
 
     async def watch(
         self,
@@ -436,9 +503,8 @@ class TiledLogClient:
             else:
                 current_lag = -remaining_time
                 if current_lag > lag:
-                    shard_prefix = f"shard{self.shard_id}:" if self.shard_id is not None else ""
                     logger.warning(
-                        f"{int(time.time())}:{shard_prefix}Poll cycle for {self.log_meta.url} exceeded interval by {current_lag:.2f}s"
+                        f"{int(time.time())}:{self._get_group_prefix()}Poll cycle for {self.log_meta.url} exceeded interval by {current_lag:.2f}s"
                     )
                 lag = current_lag
 
@@ -447,6 +513,7 @@ class ClassicLogClient:
     """Client for interacting with classic CT logs"""
 
     DEFAULT_USER_AGENT = f"CT-Moniteur/{__version__}"
+    PARSE_BATCH_SIZE = 1000  # Parse this many entries in parallel
 
     def __init__(
         self,
@@ -455,17 +522,31 @@ class ClassicLogClient:
         user_agent: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         shard_id: Optional[int] = None,
+        executor: Optional[ThreadPoolExecutor] = None,
     ):
         self.log_meta = log_meta
         self.timeout = timeout
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
         self.shard_id = shard_id
+        self._executor = executor
         self._client = httpx.AsyncClient(
             base_url=log_meta.url,
             timeout=self.timeout,
             headers={"User-Agent": self.user_agent},
             transport=transport or RateLimitedTransport(),
         )
+
+    def _get_group_prefix(self) -> str:
+        """Get group-aware prefix based on log URL."""
+        if self.shard_id is None:
+            return ""
+        url = self.log_meta.url
+        if "googleapis.com" in url:
+            return f"google{self.shard_id}:"
+        elif "trustasia.com" in url:
+            return f"trustasia{self.shard_id}:"
+        else:
+            return f"shard{self.shard_id}:"
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -647,15 +728,66 @@ class ClassicLogClient:
         Yields:
             CertificateEntry objects for new entries
         """
+        batch: List[tuple[int, LogEntry]] = []
+
         async for entry_index, log_entry in self.fetch_entries_raw(start_index):
+            batch.append((entry_index, log_entry))
+
+            if len(batch) >= self.PARSE_BATCH_SIZE:
+                async for entry in self._parse_batch(batch):
+                    yield entry
+                batch = []
+
+        # Process remaining entries
+        if batch:
+            async for entry in self._parse_batch(batch):
+                yield entry
+
+    async def _parse_batch(
+        self, batch: List[tuple[int, LogEntry]]
+    ) -> AsyncIterator[CertificateEntry]:
+        """Parse a batch of entries in parallel using thread pool."""
+        if not batch:
+            return
+
+        if self._executor is None:
+            # Fallback to sequential parsing
+            for entry_index, log_entry in batch:
+                try:
+                    source = EntrySource(index=entry_index, log=self.log_meta)
+                    entry = CertificateParser.parse_log_entry(log_entry, source)
+                    yield entry
+                except Exception as e:
+                    logger.warning(
+                        f"Error parsing classic entry {entry_index} from {self.log_meta.url}: {e}"
+                    )
+            return
+
+        loop = asyncio.get_running_loop()
+
+        def parse_one(item: tuple[int, LogEntry]) -> Optional[CertificateEntry]:
+            entry_index, log_entry = item
             try:
                 source = EntrySource(index=entry_index, log=self.log_meta)
-                entry = CertificateParser.parse_log_entry(log_entry, source)
-                yield entry
+                return CertificateParser.parse_log_entry(log_entry, source)
             except Exception as e:
                 logger.warning(
                     f"Error parsing classic entry {entry_index} from {self.log_meta.url}: {e}"
                 )
+                return None
+
+        # Submit all parse tasks to thread pool
+        futures = [
+            loop.run_in_executor(self._executor, parse_one, item)
+            for item in batch
+        ]
+
+        # Gather results preserving order
+        results = await asyncio.gather(*futures)
+
+        for entry in results:
+            if entry is not None:
+                yield entry
 
     async def watch(
         self,
@@ -700,9 +832,8 @@ class ClassicLogClient:
             else:
                 current_lag = -remaining_time
                 if current_lag > lag:
-                    shard_prefix = f"shard{self.shard_id}:" if self.shard_id is not None else ""
                     logger.warning(
-                        f"{int(time.time())}:{shard_prefix}Poll cycle for {self.log_meta.url} exceeded interval by {current_lag:.2f}s"
+                        f"{int(time.time())}:{self._get_group_prefix()}Poll cycle for {self.log_meta.url} exceeded interval by {current_lag:.2f}s"
                     )
                 lag = current_lag
 
@@ -812,6 +943,7 @@ class CTMoniteur:
         exclude_logs: Optional[List[str]] = None,
         shard_id: Optional[int] = None,
         total_shards: Optional[int] = None,
+        parse_workers: int = 4,
     ):
         """
         Initialize CT Moniteur.
@@ -832,6 +964,7 @@ class CTMoniteur:
             exclude_logs: Skip logs matching these patterns (partial URL match)
             shard_id: This instance's shard ID (0 to total_shards-1)
             total_shards: Total number of shards for distributed processing
+            parse_workers: Number of threads for parallel certificate parsing
         """
         self.callback = callback
         self.skip_retired = skip_retired
@@ -845,6 +978,7 @@ class CTMoniteur:
         self.exclude_logs = exclude_logs
         self.shard_id = shard_id
         self.total_shards = total_shards
+        self.parse_workers = parse_workers
 
         self._state: Dict[str, int] = initial_state or {}
         self._clients: List[Union[TiledLogClient, ClassicLogClient]] = []
@@ -858,6 +992,7 @@ class CTMoniteur:
             shard_id=shard_id,
         )
         self._refresh_task: Optional[asyncio.Task] = None
+        self._executor: Optional[ThreadPoolExecutor] = None
 
     async def start(self) -> None:
         """
@@ -871,6 +1006,10 @@ class CTMoniteur:
 
         self._running = True
         self._stats.start_time = datetime.utcnow()
+
+        # Create thread pool for parallel certificate parsing
+        if self.parse_workers > 0:
+            self._executor = ThreadPoolExecutor(max_workers=self.parse_workers)
 
         self._clients = await self._create_clients()
         self._stats.active_logs = len(self._clients)
@@ -898,6 +1037,11 @@ class CTMoniteur:
                 pass
 
         await self._stop_watch_tasks()
+
+        # Shutdown thread pool executor
+        if self._executor:
+            self._executor.shutdown(wait=True)
+            self._executor = None
 
         logger.info("CT Moniteur stopped")
 
@@ -1010,6 +1154,7 @@ class CTMoniteur:
                         user_agent=self.user_agent,
                         transport=self._transport,
                         shard_id=self.shard_id,
+                        executor=self._executor,
                     )
                 else:
                     client = TiledLogClient(
@@ -1018,6 +1163,7 @@ class CTMoniteur:
                         user_agent=self.user_agent,
                         transport=self._transport,
                         shard_id=self.shard_id,
+                        executor=self._executor,
                     )
                 clients.append(client)
 
