@@ -801,6 +801,8 @@ class CTMoniteur:
         refresh_interval: float = 6.0,
         max_connections: int = 100,
         max_keepalive_connections: int = 20,
+        include_logs: Optional[List[str]] = None,
+        exclude_logs: Optional[List[str]] = None,
     ):
         """
         Initialize CT Moniteur.
@@ -817,6 +819,8 @@ class CTMoniteur:
             refresh_interval: How often to refresh the log list (hours, 0 to disable)
             max_connections: Max concurrent connections across all logs
             max_keepalive_connections: Max keepalive connections in pool
+            include_logs: Only monitor logs matching these patterns (partial URL match)
+            exclude_logs: Skip logs matching these patterns (partial URL match)
         """
         self.callback = callback
         self.skip_retired = skip_retired
@@ -826,6 +830,8 @@ class CTMoniteur:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.refresh_interval = refresh_interval
+        self.include_logs = include_logs
+        self.exclude_logs = exclude_logs
 
         self._state: Dict[str, int] = initial_state or {}
         self._clients: List[Union[TiledLogClient, ClassicLogClient]] = []
@@ -900,6 +906,16 @@ class CTMoniteur:
         """Get monitoring statistics."""
         return self._stats
 
+    def _should_include_log(self, url: str) -> bool:
+        """Check if log URL should be included based on filters."""
+        if self.include_logs:
+            if not any(pattern in url for pattern in self.include_logs):
+                return False
+        if self.exclude_logs:
+            if any(pattern in url for pattern in self.exclude_logs):
+                return False
+        return True
+
     async def _create_clients(self) -> List[Union[TiledLogClient, ClassicLogClient]]:
         """Create clients for all CT logs."""
         log_list = await self._fetch_log_list()
@@ -916,7 +932,7 @@ class CTMoniteur:
                 url = log.get("url", "")
                 description = log.get("description", "")
 
-                if url:
+                if url and self._should_include_log(url):
                     log_meta = LogMeta(
                         url=url,
                         name=description,
@@ -938,7 +954,7 @@ class CTMoniteur:
                 url = log.get("monitoring_url", "")
                 description = log.get("description", "")
 
-                if url:
+                if url and self._should_include_log(url):
                     log_meta = LogMeta(
                         url=url,
                         name=description,
