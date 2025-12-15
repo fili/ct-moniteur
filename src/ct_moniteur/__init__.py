@@ -920,74 +920,105 @@ class CTMoniteur:
         return self._stats
 
     def _should_include_log(self, url: str) -> bool:
-        """Check if log URL should be included based on filters and sharding."""
-        # Check include/exclude patterns first
+        """Check if log URL should be included based on include/exclude filters."""
         if self.include_logs:
             if not any(pattern in url for pattern in self.include_logs):
                 return False
         if self.exclude_logs:
             if any(pattern in url for pattern in self.exclude_logs):
                 return False
-        # Check sharding
-        if self.shard_id is not None and self.total_shards is not None:
-            url_hash = hash(url) % self.total_shards
-            if url_hash != self.shard_id:
-                return False
         return True
+
+    def _get_shard_for_url(self, url: str) -> int:
+        """Get shard assignment for URL. Spreads same hostname across shards."""
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        hostname = parsed.netloc
+        path = parsed.path
+        # Combine hostname and path hashes to spread same-host logs across shards
+        # while keeping assignment stable when new logs are added
+        host_hash = int(hashlib.md5(hostname.encode()).hexdigest(), 16)
+        path_hash = int(hashlib.md5(path.encode()).hexdigest(), 16)
+        return (host_hash + path_hash) % self.total_shards
 
     async def _create_clients(self) -> List[Union[TiledLogClient, ClassicLogClient]]:
         """Create clients for all CT logs."""
-        log_list = await self._fetch_log_list()
-        clients: List[Union[TiledLogClient, ClassicLogClient]] = []
+        from urllib.parse import urlparse
+        from collections import defaultdict
 
+        log_list = await self._fetch_log_list()
+
+        # Collect all logs first (apply include/exclude filters)
+        all_logs: List[Dict[str, Any]] = []
         for operator in log_list.get("operators", []):
             operator_name = operator.get("name", "Unknown")
 
-            # Classic logs
             for log in operator.get("logs", []):
                 if self.skip_retired and log.get("state", {}).get("retired"):
                     continue
-
                 url = log.get("url", "")
-                description = log.get("description", "")
-
                 if url and self._should_include_log(url):
-                    log_meta = LogMeta(
-                        url=url,
-                        name=description,
-                        operator=operator_name,
-                    )
-                    classic_client = ClassicLogClient(
-                        log_meta=log_meta,
-                        timeout=self.timeout,
-                        user_agent=self.user_agent,
-                        transport=self._transport,
-                        shard_id=self.shard_id,
-                    )
-                    clients.append(classic_client)
+                    all_logs.append({
+                        "url": url,
+                        "description": log.get("description", ""),
+                        "operator": operator_name,
+                        "type": "classic",
+                    })
 
-            # Tiled logs
             for log in operator.get("tiled_logs", []):
                 if self.skip_retired and log.get("state", {}).get("retired"):
                     continue
-
                 url = log.get("monitoring_url", "")
-                description = log.get("description", "")
-
                 if url and self._should_include_log(url):
-                    log_meta = LogMeta(
-                        url=url,
-                        name=description,
-                        operator=operator_name,
-                    )
-                    tiled_client = TiledLogClient(
+                    all_logs.append({
+                        "url": url,
+                        "description": log.get("description", ""),
+                        "operator": operator_name,
+                        "type": "tiled",
+                    })
+
+        # Group by hostname and sort for deterministic ordering
+        by_host: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for log in all_logs:
+            hostname = urlparse(log["url"]).netloc
+            by_host[hostname].append(log)
+
+        for hostname in by_host:
+            by_host[hostname].sort(key=lambda x: x["url"])
+
+        # Assign shards based on hostname+path hash (stable when new logs added)
+        clients: List[Union[TiledLogClient, ClassicLogClient]] = []
+        for hostname, logs in by_host.items():
+            for log in logs:
+                # Skip if sharding enabled and not our shard
+                if self.shard_id is not None and self.total_shards is not None:
+                    shard = self._get_shard_for_url(log["url"])
+                    if shard != self.shard_id:
+                        continue
+
+                log_meta = LogMeta(
+                    url=log["url"],
+                    name=log["description"],
+                    operator=log["operator"],
+                )
+
+                if log["type"] == "classic":
+                    client = ClassicLogClient(
                         log_meta=log_meta,
                         timeout=self.timeout,
                         user_agent=self.user_agent,
                         transport=self._transport,
                         shard_id=self.shard_id,
                     )
-                    clients.append(tiled_client)
+                else:
+                    client = TiledLogClient(
+                        log_meta=log_meta,
+                        timeout=self.timeout,
+                        user_agent=self.user_agent,
+                        transport=self._transport,
+                        shard_id=self.shard_id,
+                    )
+                clients.append(client)
 
         return clients
 

@@ -237,24 +237,31 @@ monitor = CTMoniteur(
 Automatically distribute logs across multiple instances using hash-based sharding:
 
 ```python
-# Instance 0 of 4
+# Instance 0 of 6
 monitor = CTMoniteur(
     callback=process_certificate,
     shard_id=0,
-    total_shards=4
+    total_shards=6
 )
 
-# Instance 1 of 4
+# Instance 1 of 6
 monitor = CTMoniteur(
     callback=process_certificate,
     shard_id=1,
-    total_shards=4
+    total_shards=6
 )
 ```
 
-Each log URL is assigned to a shard using `hash(url) % total_shards`. Benefits:
-- New logs automatically assigned to a shard
-- Even distribution without manual configuration
+**Algorithm:** `(md5(hostname) + md5(path)) % total_shards`
+
+- Uses MD5 hash (deterministic across processes, unlike Python's `hash()`)
+- Combines hostname and path hashes to spread same-host logs across shards
+- Example: ct.googleapis.com has 46 logs → distributed across all shards
+
+**Benefits:**
+- High-volume hostnames spread across all shards (not clustered)
+- Stable: adding/removing logs doesn't reshuffle existing assignments
+- New logs automatically assigned without coordination
 - Scale by increasing `total_shards` and adding instances
 
 ### Connection Pool Tuning
@@ -350,11 +357,15 @@ Each key is a log URL, and the value is the last processed index.
 
 ## Performance Considerations
 
-- The library monitors dozens of logs concurrently using asyncio
+- The library monitors ~250 logs concurrently using asyncio
 - Use async callbacks for I/O operations (database, API calls)
 - Save state periodically (every 30-60 seconds) to avoid data loss
 - Consider filtering certificates in the callback to reduce processing load
 - Logs are polled with staggered delays to avoid request bursts
+- Poll cycle warnings include Unix timestamp and shard_id prefix for debugging:
+  ```
+  1765798677:shard3:Poll cycle for https://ct.googleapis.com/logs/us1/argon2026h1/ exceeded interval by 12.42s
+  ```
 
 ## License
 
