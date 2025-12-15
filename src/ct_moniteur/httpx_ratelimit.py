@@ -58,11 +58,12 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
 
                 if host_data.request_count % 1_000 == 0:
                     elapsed = time.monotonic() - host_data.first_request_time
-                    actual_rate = host_data.request_count / elapsed
-                    logger.info(
-                        f"[{host}] Rate statistics: {host_data.request_count} requests in {elapsed:.2f}s "
-                        f"({actual_rate:.2f} req/s)"
-                    )
+                    if elapsed > 0:
+                        actual_rate = host_data.request_count / elapsed
+                        logger.info(
+                            f"[{host}] Rate stats: {host_data.request_count} reqs "
+                            f"in {elapsed:.2f}s ({actual_rate:.2f} req/s)"
+                        )
                     host_data.first_request_time = None
                     host_data.request_count = 0
 
@@ -73,11 +74,14 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                 async with host_data.lock:
                     if host_data.first_request_time:
                         elapsed = time.monotonic() - host_data.first_request_time
-                        host_data.rate_limit = (host_data.request_count - 1) / elapsed
-                        logger.info(
-                            f"[{host}] Rate limit learned: {host_data.rate_limit:.2f} req/s"
-                        )
-                        default_retry_after = min(1.0 / host_data.rate_limit, 10.0)
+                        if elapsed > 0 and host_data.request_count > 1:
+                            host_data.rate_limit = (host_data.request_count - 1) / elapsed
+                            logger.info(
+                                f"[{host}] Rate limit learned: {host_data.rate_limit:.2f} req/s"
+                            )
+                            default_retry_after = min(1.0 / host_data.rate_limit, 10.0)
+                        else:
+                            default_retry_after = 5.0
                     else:
                         default_retry_after = 5.0
 
