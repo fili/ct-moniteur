@@ -799,6 +799,8 @@ class CTMoniteur:
         max_retries: int = 5,
         retry_delay: float = 10.0,
         refresh_interval: float = 6.0,
+        max_connections: int = 100,
+        max_keepalive_connections: int = 20,
     ):
         """
         Initialize CT Moniteur.
@@ -813,6 +815,8 @@ class CTMoniteur:
             max_retries: Maximum retries for failed log connections
             retry_delay: Delay between retries (seconds)
             refresh_interval: How often to refresh the log list (hours, 0 to disable)
+            max_connections: Max concurrent connections across all logs
+            max_keepalive_connections: Max keepalive connections in pool
         """
         self.callback = callback
         self.skip_retired = skip_retired
@@ -829,7 +833,10 @@ class CTMoniteur:
         self._running = False
         self._stats = MoniteurStats()
         self._state_lock = asyncio.Lock()
-        self._transport = RateLimitedTransport()
+        self._transport = RateLimitedTransport(
+            max_connections=max_connections,
+            max_keepalive_connections=max_keepalive_connections,
+        )
         self._refresh_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:

@@ -22,8 +22,19 @@ class HostData:
 class RateLimitedTransport(httpx.AsyncHTTPTransport):
     """httpx transport that learns and enforces rate limits from 429 responses."""
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        max_connections: int = 100,
+        max_keepalive_connections: int = 20,
+        **kwargs
+    ):
+        super().__init__(
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+            ),
+            **kwargs
+        )
         self._host_data: dict[str, HostData] = {}
 
     def _get_host_data(self, host: str) -> HostData:
