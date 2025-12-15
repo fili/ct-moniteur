@@ -18,6 +18,9 @@ This library is an independent project and is not an official product. It is pro
 - **Multi-log monitoring** - Monitor all public CT logs concurrently
 - **Comprehensive error handling** - Robust error handling and logging
 - **CLI tool included** - Monitor CT logs without writing code
+- **Connection pool tuning** - Configure max connections and keepalive
+- **Log filtering** - Include/exclude logs by URL patterns
+- **Sharding support** - Distribute logs across multiple instances
 
 ## Installation
 
@@ -202,6 +205,70 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+## Sharding and Filtering
+
+### Log Filtering
+
+Include or exclude specific logs by URL patterns:
+
+```python
+# Only monitor Google logs
+monitor = CTMoniteur(
+    callback=process_certificate,
+    include_logs=["googleapis.com"]
+)
+
+# Exclude Let's Encrypt logs
+monitor = CTMoniteur(
+    callback=process_certificate,
+    exclude_logs=["letsencrypt.org"]
+)
+
+# Combine both
+monitor = CTMoniteur(
+    callback=process_certificate,
+    include_logs=["googleapis.com", "cloudflare"],
+    exclude_logs=["argon2025"]
+)
+```
+
+### Distributed Processing with Sharding
+
+Automatically distribute logs across multiple instances using hash-based sharding:
+
+```python
+# Instance 0 of 4
+monitor = CTMoniteur(
+    callback=process_certificate,
+    shard_id=0,
+    total_shards=4
+)
+
+# Instance 1 of 4
+monitor = CTMoniteur(
+    callback=process_certificate,
+    shard_id=1,
+    total_shards=4
+)
+```
+
+Each log URL is assigned to a shard using `hash(url) % total_shards`. Benefits:
+- New logs automatically assigned to a shard
+- Even distribution without manual configuration
+- Scale by increasing `total_shards` and adding instances
+
+### Connection Pool Tuning
+
+Adjust connection limits for high-throughput scenarios:
+
+```python
+monitor = CTMoniteur(
+    callback=process_certificate,
+    max_connections=200,           # Total connections
+    max_keepalive_connections=50   # Persistent connections
+)
+```
+
 ## API Reference
 
 ### CTMoniteur
@@ -219,7 +286,13 @@ CTMoniteur(
     user_agent: str = None,          # Custom user agent
     max_retries: int = 3,            # Max retries per log
     retry_delay: float = 10.0,       # Delay between retries
-    refresh_interval: float = 6.0    # Log list refresh interval in hours (0 to disable)
+    refresh_interval: float = 6.0,   # Log list refresh interval in hours (0 to disable)
+    max_connections: int = 100,      # HTTP connection pool size
+    max_keepalive_connections: int = 20,  # Keepalive connections
+    include_logs: List[str] = None,  # Only include logs matching patterns
+    exclude_logs: List[str] = None,  # Exclude logs matching patterns
+    shard_id: int = None,            # Shard ID for distributed processing
+    total_shards: int = None,        # Total number of shards
 )
 ```
 
