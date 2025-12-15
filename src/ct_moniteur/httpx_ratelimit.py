@@ -8,7 +8,7 @@ import logging
 
 import httpx
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ct_moniteur")
 
 
 @dataclass
@@ -26,6 +26,7 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
         self,
         max_connections: int = 100,
         max_keepalive_connections: int = 20,
+        shard_id: Optional[int] = None,
         **kwargs
     ):
         super().__init__(
@@ -36,6 +37,8 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
             **kwargs
         )
         self._host_data: dict[str, HostData] = {}
+        self._shard_id = shard_id
+        self._shard_prefix = f"shard{shard_id}:" if shard_id is not None else ""
 
     def _get_host_data(self, host: str) -> HostData:
         """Get or create host tracking data."""
@@ -61,8 +64,8 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                     if elapsed > 0:
                         actual_rate = host_data.request_count / elapsed
                         logger.info(
-                            f"[{host}] Rate stats: {host_data.request_count} reqs "
-                            f"in {elapsed:.2f}s ({actual_rate:.2f} req/s)"
+                            f"{int(time.time())}:{self._shard_prefix}[{host}] Rate stats: "
+                            f"{host_data.request_count} reqs in {elapsed:.2f}s ({actual_rate:.2f} req/s)"
                         )
                     host_data.first_request_time = None
                     host_data.request_count = 0
@@ -77,7 +80,8 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                         if elapsed > 0 and host_data.request_count > 1:
                             host_data.rate_limit = (host_data.request_count - 1) / elapsed
                             logger.info(
-                                f"[{host}] Rate limit learned: {host_data.rate_limit:.2f} req/s"
+                                f"{int(time.time())}:{self._shard_prefix}[{host}] Rate limit learned: "
+                                f"{host_data.rate_limit:.2f} req/s"
                             )
                             default_retry_after = min(1.0 / host_data.rate_limit, 10.0)
                         else:
@@ -96,11 +100,13 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
 
                     if attempt > 1:
                         logger.warning(
-                            f"[{host}] Rate limited (429): attempt {attempt}, retrying after {wait_time}s"
+                            f"{int(time.time())}:{self._shard_prefix}[{host}] Rate limited (429): "
+                            f"attempt {attempt}, retrying after {wait_time}s"
                         )
                     else:
                         logger.info(
-                            f"[{host}] Rate limited (429): attempt {attempt}, retrying after {wait_time}s"
+                            f"{int(time.time())}:{self._shard_prefix}[{host}] Rate limited (429): "
+                            f"attempt {attempt}, retrying after {wait_time}s"
                         )
                     await asyncio.sleep(wait_time)
             else:

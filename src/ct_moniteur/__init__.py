@@ -855,6 +855,7 @@ class CTMoniteur:
         self._transport = RateLimitedTransport(
             max_connections=max_connections,
             max_keepalive_connections=max_keepalive_connections,
+            shard_id=shard_id,
         )
         self._refresh_task: Optional[asyncio.Task] = None
 
@@ -1090,8 +1091,9 @@ class CTMoniteur:
 
                 # Strip verbose httpx error info
                 err_msg = str(e).split('\n')[0]
+                shard_prefix = f"shard{self.shard_id}:" if self.shard_id is not None else ""
                 logger.warning(
-                    f"Error watching {client.log_meta.url} (retry {retries}/{self.max_retries}): {err_msg}"
+                    f"{int(time.time())}:{shard_prefix}Error watching {client.log_meta.url} (retry {retries}/{self.max_retries}): {err_msg}"
                 )
 
                 if retries >= self.max_retries:
