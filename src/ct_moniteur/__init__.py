@@ -1237,9 +1237,8 @@ class CTMoniteur:
 
                 # Strip verbose httpx error info
                 err_msg = str(e).split('\n')[0]
-                shard_prefix = f"shard{self.shard_id}:" if self.shard_id is not None else ""
                 logger.warning(
-                    f"{int(time.time())}:{shard_prefix}Error watching {client.log_meta.url} (retry {retries}/{self.max_retries}): {err_msg}"
+                    f"{int(time.time())}:{client._get_group_prefix()}Error watching {client.log_meta.url} (retry {retries}/{self.max_retries}): {err_msg}"
                 )
 
                 if retries >= self.max_retries:
