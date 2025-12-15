@@ -1020,8 +1020,10 @@ class CTMoniteur:
                         self._stats.errors_per_log.get(client.log_meta.url, 0) + 1
                     )
 
+                # Strip verbose httpx error info
+                err_msg = str(e).split('\n')[0]
                 logger.warning(
-                    f"Error watching {client.log_meta.url} (retry {retries}/{self.max_retries}): {e}"
+                    f"Error watching {client.log_meta.url} (retry {retries}/{self.max_retries}): {err_msg}"
                 )
 
                 if retries >= self.max_retries:
