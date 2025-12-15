@@ -7,6 +7,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
@@ -122,10 +123,12 @@ class TiledLogClient:
         timeout: float = 30.0,
         user_agent: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        shard_id: Optional[int] = None,
     ):
         self.log_meta = log_meta
         self.timeout = timeout
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
+        self.shard_id = shard_id
         self._client = httpx.AsyncClient(
             base_url=log_meta.url,
             timeout=self.timeout,
@@ -433,8 +436,9 @@ class TiledLogClient:
             else:
                 current_lag = -remaining_time
                 if current_lag > lag:
+                    shard_prefix = f"shard{self.shard_id}:" if self.shard_id is not None else ""
                     logger.warning(
-                        f"Poll cycle for {self.log_meta.url} exceeded interval by {current_lag:.2f}s"
+                        f"{int(time.time())}:{shard_prefix}Poll cycle for {self.log_meta.url} exceeded interval by {current_lag:.2f}s"
                     )
                 lag = current_lag
 
@@ -450,10 +454,12 @@ class ClassicLogClient:
         timeout: float = 30.0,
         user_agent: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        shard_id: Optional[int] = None,
     ):
         self.log_meta = log_meta
         self.timeout = timeout
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
+        self.shard_id = shard_id
         self._client = httpx.AsyncClient(
             base_url=log_meta.url,
             timeout=self.timeout,
@@ -694,8 +700,9 @@ class ClassicLogClient:
             else:
                 current_lag = -remaining_time
                 if current_lag > lag:
+                    shard_prefix = f"shard{self.shard_id}:" if self.shard_id is not None else ""
                     logger.warning(
-                        f"Poll cycle for {self.log_meta.url} exceeded interval by {current_lag:.2f}s"
+                        f"{int(time.time())}:{shard_prefix}Poll cycle for {self.log_meta.url} exceeded interval by {current_lag:.2f}s"
                     )
                 lag = current_lag
 
@@ -955,6 +962,7 @@ class CTMoniteur:
                         timeout=self.timeout,
                         user_agent=self.user_agent,
                         transport=self._transport,
+                        shard_id=self.shard_id,
                     )
                     clients.append(classic_client)
 
@@ -977,6 +985,7 @@ class CTMoniteur:
                         timeout=self.timeout,
                         user_agent=self.user_agent,
                         transport=self._transport,
+                        shard_id=self.shard_id,
                     )
                     clients.append(tiled_client)
 
