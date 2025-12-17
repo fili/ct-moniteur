@@ -8,7 +8,7 @@ import base64
 import hashlib
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
@@ -87,7 +87,6 @@ class CertificateEntry:
 
     timestamp: int
     entry_type: str  # "X509LogEntry" or "PrecertLogEntry"
-    certificate: x509.Certificate
     source: EntrySource
 
     # Certificate details
@@ -99,6 +98,47 @@ class CertificateEntry:
     serial_number: str = ""
     fingerprint_sha256: str = ""
     fingerprint_sha1: str = ""
+    certificate: Optional[x509.Certificate] = None  # Optional for multiprocessing
+
+
+@dataclass
+class RawEntry:
+    """Unparsed entry for deferred parsing (fetcher -> parser architecture)."""
+
+    index: int
+    timestamp: int
+    entry_type: int  # 0=X509, 1=Precert
+    cert_data: bytes  # DER encoded certificate
+    log_url: str
+    log_name: str
+    log_operator: str
+
+
+@dataclass
+class LogState:
+    """Extended state for a single CT log with gap tracking."""
+
+    current_index: int = 0  # Highest contiguous index (safe restart point)
+    highest_fetched: int = 0  # Highest index we've successfully fetched
+    gaps: List[List[int]] = field(default_factory=list)  # [[start, end], ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "current_index": self.current_index,
+            "highest_fetched": self.highest_fetched,
+            "gaps": self.gaps,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "LogState":
+        if isinstance(data, int):
+            # Backwards compatibility: old format was just an int
+            return cls(current_index=data, highest_fetched=data, gaps=[])
+        return cls(
+            current_index=data.get("current_index", 0),
+            highest_fetched=data.get("highest_fetched", 0),
+            gaps=data.get("gaps", []),
+        )
 
 
 @dataclass
@@ -112,12 +152,85 @@ class MoniteurStats:
     start_time: Optional[datetime] = None
 
 
+def _mp_parse_entry(args: tuple) -> Optional[tuple]:
+    """
+    Multiprocessing worker for certificate parsing.
+    Must be module-level for pickling.
+
+    Args:
+        args: (entry_index, timestamp, entry_type_val, entry_data,
+               log_url, log_name, log_operator)
+
+    Returns:
+        Tuple of parsed data or None on error
+    """
+    (entry_index, timestamp, entry_type_val, entry_data,
+     log_url, log_name, log_operator) = args
+
+    try:
+        if entry_type_val == 0:
+            entry_type_str = "X509LogEntry"
+        elif entry_type_val == 1:
+            entry_type_str = "PrecertLogEntry"
+        else:
+            return None
+
+        cert = x509.load_der_x509_certificate(entry_data, default_backend())
+
+        # Extract domains
+        domains: List[str] = []
+        try:
+            cn_attr = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+            if cn_attr:
+                cn_value = cn_attr[0].value
+                if isinstance(cn_value, bytes):
+                    cn_value = cn_value.decode("utf-8", errors="ignore")
+                domains.append(str(cn_value))
+        except Exception:
+            pass
+
+        try:
+            san_ext = cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            )
+            san_names = san_ext.value.get_values_for_type(x509.DNSName)
+            domains.extend(san_names)
+        except Exception:
+            pass
+
+        domains = list(set(domains))
+
+        # Calculate fingerprints
+        sha256_fp = ":".join(f"{b:02X}" for b in hashlib.sha256(entry_data).digest())
+        sha1_fp = ":".join(f"{b:02X}" for b in hashlib.sha1(entry_data).digest())
+
+        return (
+            entry_index,
+            timestamp,
+            entry_type_str,
+            domains,
+            cert.subject.rfc4514_string(),
+            cert.issuer.rfc4514_string(),
+            cert.not_valid_before_utc,
+            cert.not_valid_after_utc,
+            format(cert.serial_number, "X"),
+            sha256_fp,
+            sha1_fp,
+            log_url,
+            log_name,
+            log_operator,
+        )
+    except Exception:
+        return None
+
+
 class TiledLogClient:
     """Client for interacting with tiled CT logs"""
 
     DEFAULT_USER_AGENT = f"CT-Moniteur/{__version__}"
     TILE_SIZE = 256
     PARSE_BATCH_SIZE = 256  # Parse this many entries in parallel
+    RAW_BATCH_SIZE = 1000   # Entries per batch in raw mode
 
     def __init__(
         self,
@@ -126,13 +239,19 @@ class TiledLogClient:
         user_agent: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         shard_id: Optional[int] = None,
-        executor: Optional[ThreadPoolExecutor] = None,
+        total_shards: Optional[int] = None,
+        executor: Optional[ProcessPoolExecutor] = None,
+        log_prefix: Optional[str] = None,
+        parallel_fetches: int = 1,
     ):
         self.log_meta = log_meta
         self.timeout = timeout
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
         self.shard_id = shard_id
+        self.total_shards = total_shards
         self._executor = executor
+        self._log_prefix = log_prefix
+        self._parallel_fetches = parallel_fetches
         self._client = httpx.AsyncClient(
             base_url=log_meta.url,
             timeout=self.timeout,
@@ -141,11 +260,18 @@ class TiledLogClient:
         )
 
     def _get_group_prefix(self) -> str:
-        """Get group-aware prefix based on log URL."""
+        """Get group-aware prefix based on log URL or custom prefix."""
+        if self._log_prefix:
+            return f"{self._log_prefix}:"
         if self.shard_id is None:
             return ""
         url = self.log_meta.url
-        if "googleapis.com" in url:
+        # Check for specific high-volume log names first
+        if "/argon" in url:
+            return f"argon{self.shard_id}:"
+        elif "/xenon" in url:
+            return f"xenon{self.shard_id}:"
+        elif "googleapis.com" in url:
             return f"google{self.shard_id}:"
         elif "trustasia.com" in url:
             return f"trustasia{self.shard_id}:"
@@ -389,12 +515,16 @@ class TiledLogClient:
     async def fetch_entries(
         self,
         start_index: int,
+        entry_shard_id: Optional[int] = None,
+        entry_total_shards: Optional[int] = None,
     ) -> AsyncIterator[CertificateEntry]:
         """
         Fetch new entries from the tiled log since the given index.
 
         Args:
             start_index: Index of first entry to retrieve (inclusive)
+            entry_shard_id: If set, only process entries where index % total == shard_id
+            entry_total_shards: Total shards for entry-level distribution
 
         Yields:
             CertificateEntry objects for new entries
@@ -402,6 +532,11 @@ class TiledLogClient:
         batch: List[tuple[int, LogEntry]] = []
 
         async for entry_index, leaf in self.fetch_entries_raw(start_index):
+            # Entry-level sharding: skip entries not assigned to this shard
+            if entry_shard_id is not None and entry_total_shards is not None:
+                if entry_index % entry_total_shards != entry_shard_id:
+                    continue
+
             batch.append((entry_index, leaf))
 
             if len(batch) >= self.PARSE_BATCH_SIZE:
@@ -417,7 +552,7 @@ class TiledLogClient:
     async def _parse_batch(
         self, batch: List[tuple[int, LogEntry]]
     ) -> AsyncIterator[CertificateEntry]:
-        """Parse a batch of entries in parallel using thread pool."""
+        """Parse a batch of entries in parallel using process pool."""
         if not batch:
             return
 
@@ -430,34 +565,59 @@ class TiledLogClient:
                     yield entry
                 except Exception as e:
                     logger.warning(
-                        f"Error parsing tiled entry {entry_index} from {self.log_meta.url}: {e}"
+                        f"Error parsing tiled entry {entry_index} from "
+                        f"{self.log_meta.url}: {e}"
                     )
             return
 
         loop = asyncio.get_running_loop()
 
-        def parse_one(item: tuple[int, LogEntry]) -> Optional[CertificateEntry]:
-            entry_index, leaf = item
-            try:
-                source = EntrySource(index=entry_index, log=self.log_meta)
-                return CertificateParser.parse_log_entry(leaf, source)
-            except Exception as e:
-                logger.warning(
-                    f"Error parsing tiled entry {entry_index} from {self.log_meta.url}: {e}"
-                )
-                return None
-
-        # Submit all parse tasks to thread pool
-        futures = [
-            loop.run_in_executor(self._executor, parse_one, item)
-            for item in batch
+        # Prepare args for multiprocessing (must be picklable)
+        mp_args = [
+            (
+                entry_index,
+                leaf.timestamp,
+                int(leaf.entry_type),
+                leaf.entry,
+                self.log_meta.url,
+                self.log_meta.name,
+                self.log_meta.operator,
+            )
+            for entry_index, leaf in batch
         ]
 
-        # Gather results preserving order
+        # Submit to process pool
+        futures = [
+            loop.run_in_executor(self._executor, _mp_parse_entry, args)
+            for args in mp_args
+        ]
+
         results = await asyncio.gather(*futures)
 
-        for entry in results:
-            if entry is not None:
+        # Convert results back to CertificateEntry
+        for result in results:
+            if result is not None:
+                (entry_index, timestamp, entry_type, domains, subject,
+                 issuer, not_before, not_after, serial, sha256_fp,
+                 sha1_fp, log_url, log_name, log_operator) = result
+
+                source = EntrySource(
+                    index=entry_index,
+                    log=LogMeta(url=log_url, name=log_name, operator=log_operator)
+                )
+                entry = CertificateEntry(
+                    timestamp=timestamp,
+                    entry_type=entry_type,
+                    source=source,
+                    domains=domains,
+                    subject=subject,
+                    issuer=issuer,
+                    not_before=not_before,
+                    not_after=not_after,
+                    serial_number=serial,
+                    fingerprint_sha256=sha256_fp,
+                    fingerprint_sha1=sha1_fp,
+                )
                 yield entry
 
     async def watch(
@@ -490,7 +650,11 @@ class TiledLogClient:
             loop = asyncio.get_running_loop()
             cycle_start = loop.time()
 
-            async for entry in self.fetch_entries(current_index + 1):
+            async for entry in self.fetch_entries(
+                current_index + 1,
+                entry_shard_id=self.shard_id,
+                entry_total_shards=self.total_shards,
+            ):
                 current_index = entry.source.index
                 yield entry
 
@@ -504,7 +668,190 @@ class TiledLogClient:
                 current_lag = -remaining_time
                 if current_lag > lag:
                     logger.warning(
-                        f"{int(time.time())}:{self._get_group_prefix()}Poll cycle for {self.log_meta.url} exceeded interval by {current_lag:.2f}s"
+                        f"{int(time.time())}:{self._get_group_prefix()}Poll cycle for "
+                        f"{self.log_meta.url} exceeded interval by {current_lag:.2f}s"
+                    )
+                lag = current_lag
+
+    async def _fetch_tile_speculative(
+        self, tile_index: int
+    ) -> List[tuple[int, LogEntry]]:
+        """
+        Fetch a tile speculatively (may return empty if tile doesn't exist).
+
+        Args:
+            tile_index: The tile index to fetch
+
+        Returns:
+            List of (entry_index, LogEntry) tuples. May be empty if tile doesn't exist.
+        """
+        try:
+            leaves = await self.fetch_tile(tile_index)
+            base_index = tile_index * self.TILE_SIZE
+            return [(base_index + i, leaf) for i, leaf in enumerate(leaves)]
+        except Exception:
+            # Tile may not exist yet - that's fine for speculative fetching
+            return []
+
+    async def watch_raw(
+        self,
+        start_index: Optional[int] = None,
+        poll_interval: float = 30,
+        state: Optional[LogState] = None,
+    ) -> AsyncIterator[RawEntry]:
+        """
+        Continuously watch the log for new entries WITHOUT parsing.
+        Uses speculative parallel tile fetching with gap tracking.
+
+        Args:
+            start_index: Index to start from. If None, starts from current tree size
+            poll_interval: How often to poll for new entries (seconds)
+            state: Optional LogState for tracking gaps and progress. Updated in place.
+
+        Yields:
+            RawEntry objects (unparsed) as they are discovered
+        """
+        # Initialize state
+        if state is None:
+            state = LogState()
+
+        if start_index is not None:
+            state.current_index = start_index
+            state.highest_fetched = start_index
+
+        if state.current_index == 0 and state.highest_fetched == 0:
+            tree_size = await self.fetch_tree_size()
+            state.current_index = tree_size
+            state.highest_fetched = tree_size
+            await asyncio.sleep(poll_interval)
+
+        n_parallel = self._parallel_fetches
+        lag: float = 0
+        tile_size = self.TILE_SIZE
+
+        # Convert gaps to failed tile set for efficient lookup
+        failed_tiles: set[int] = set()
+        for gap_start, gap_end in state.gaps:
+            start_tile = gap_start // tile_size
+            end_tile = gap_end // tile_size
+            for t in range(start_tile, end_tile + 1):
+                failed_tiles.add(t)
+
+        while True:
+            loop = asyncio.get_running_loop()
+            cycle_start = loop.time()
+
+            # Keep fetching until no new data
+            while True:
+                # Calculate tiles to fetch:
+                # 1. Failed tiles (gaps) that are >= current_index tile
+                # 2. New tiles beyond highest_fetched
+                current_tile = (state.current_index + 1) // tile_size
+                highest_tile = state.highest_fetched // tile_size
+
+                tiles_to_fetch: List[int] = []
+
+                # Add failed tiles that we haven't passed yet
+                for ft in sorted(failed_tiles):
+                    if ft >= current_tile and len(tiles_to_fetch) < n_parallel:
+                        tiles_to_fetch.append(ft)
+
+                # Add new tiles beyond highest_fetched
+                next_new_tile = highest_tile + 1
+                while len(tiles_to_fetch) < n_parallel:
+                    tiles_to_fetch.append(next_new_tile)
+                    next_new_tile += 1
+
+                if not tiles_to_fetch:
+                    break
+
+                # Fetch all tiles in parallel
+                results = await asyncio.gather(
+                    *[self._fetch_tile_speculative(t) for t in tiles_to_fetch]
+                )
+
+                # Process results: track successes and failures
+                all_entries: List[tuple[int, LogEntry]] = []
+                newly_failed: set[int] = set()
+                newly_succeeded: set[int] = set()
+
+                for tile_idx, tile_results in zip(tiles_to_fetch, results):
+                    if tile_results:
+                        # Success - remove from failed, add entries
+                        newly_succeeded.add(tile_idx)
+                        for entry_index, leaf in tile_results:
+                            if entry_index > state.current_index:
+                                all_entries.append((entry_index, leaf))
+                    else:
+                        # Failed or empty - only mark as failed if within tree
+                        # (speculative fetches beyond tree return empty)
+                        if tile_idx <= highest_tile or tile_idx in failed_tiles:
+                            newly_failed.add(tile_idx)
+
+                # Update failed tiles
+                failed_tiles -= newly_succeeded
+                failed_tiles |= newly_failed
+
+                if not all_entries:
+                    break
+
+                # Sort entries by index
+                all_entries.sort(key=lambda x: x[0])
+
+                # Yield ALL successful entries immediately
+                max_entry_index = state.current_index
+                for entry_index, leaf in all_entries:
+                    yield RawEntry(
+                        index=entry_index,
+                        timestamp=leaf.timestamp,
+                        entry_type=int(leaf.entry_type),
+                        cert_data=leaf.entry,
+                        log_url=self.log_meta.url,
+                        log_name=self.log_meta.name,
+                        log_operator=self.log_meta.operator,
+                    )
+                    if entry_index > max_entry_index:
+                        max_entry_index = entry_index
+
+                # Update highest_fetched
+                if max_entry_index > state.highest_fetched:
+                    state.highest_fetched = max_entry_index
+
+                # Update current_index to highest contiguous point
+                # Walk from current_index + 1 and find where gaps start
+                new_current = state.current_index
+                check_tile = (new_current + 1) // tile_size
+                while check_tile not in failed_tiles:
+                    # This tile is complete, advance current_index
+                    tile_end = (check_tile + 1) * tile_size - 1
+                    if tile_end > state.highest_fetched:
+                        # Don't advance past what we've fetched
+                        new_current = state.highest_fetched
+                        break
+                    new_current = tile_end
+                    check_tile += 1
+
+                state.current_index = new_current
+
+                # Convert failed_tiles back to gaps for state
+                state.gaps = []
+                for ft in sorted(failed_tiles):
+                    gap_start = ft * tile_size
+                    gap_end = (ft + 1) * tile_size - 1
+                    state.gaps.append([gap_start, gap_end])
+
+            # Sleep for remaining poll interval
+            remaining_time = poll_interval - (loop.time() - cycle_start)
+
+            if remaining_time > 0:
+                await asyncio.sleep(remaining_time)
+                lag = 0
+            else:
+                current_lag = -remaining_time
+                if current_lag > lag:
+                    logger.warning(
+                        f"{int(time.time())}:{self._get_group_prefix()}Poll cycle for "
+                        f"{self.log_meta.url} exceeded interval by {current_lag:.2f}s"
                     )
                 lag = current_lag
 
@@ -514,6 +861,7 @@ class ClassicLogClient:
 
     DEFAULT_USER_AGENT = f"CT-Moniteur/{__version__}"
     PARSE_BATCH_SIZE = 1000  # Parse this many entries in parallel
+    RAW_BATCH_SIZE = 1000    # Entries per batch in raw mode
 
     def __init__(
         self,
@@ -522,13 +870,19 @@ class ClassicLogClient:
         user_agent: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         shard_id: Optional[int] = None,
-        executor: Optional[ThreadPoolExecutor] = None,
+        total_shards: Optional[int] = None,
+        executor: Optional[ProcessPoolExecutor] = None,
+        log_prefix: Optional[str] = None,
+        parallel_fetches: int = 1,
     ):
         self.log_meta = log_meta
         self.timeout = timeout
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
         self.shard_id = shard_id
+        self.total_shards = total_shards
         self._executor = executor
+        self._log_prefix = log_prefix
+        self._parallel_fetches = parallel_fetches
         self._client = httpx.AsyncClient(
             base_url=log_meta.url,
             timeout=self.timeout,
@@ -537,11 +891,18 @@ class ClassicLogClient:
         )
 
     def _get_group_prefix(self) -> str:
-        """Get group-aware prefix based on log URL."""
+        """Get group-aware prefix based on log URL or custom prefix."""
+        if self._log_prefix:
+            return f"{self._log_prefix}:"
         if self.shard_id is None:
             return ""
         url = self.log_meta.url
-        if "googleapis.com" in url:
+        # Check for specific high-volume log names first
+        if "/argon" in url:
+            return f"argon{self.shard_id}:"
+        elif "/xenon" in url:
+            return f"xenon{self.shard_id}:"
+        elif "googleapis.com" in url:
             return f"google{self.shard_id}:"
         elif "trustasia.com" in url:
             return f"trustasia{self.shard_id}:"
@@ -718,12 +1079,16 @@ class ClassicLogClient:
     async def fetch_entries(
         self,
         start_index: int,
+        entry_shard_id: Optional[int] = None,
+        entry_total_shards: Optional[int] = None,
     ) -> AsyncIterator[CertificateEntry]:
         """
         Fetch new entries from the classic log since the given index.
 
         Args:
             start_index: Index of first entry to retrieve (inclusive)
+            entry_shard_id: If set, only process entries where index % total == shard_id
+            entry_total_shards: Total shards for entry-level distribution
 
         Yields:
             CertificateEntry objects for new entries
@@ -731,6 +1096,11 @@ class ClassicLogClient:
         batch: List[tuple[int, LogEntry]] = []
 
         async for entry_index, log_entry in self.fetch_entries_raw(start_index):
+            # Entry-level sharding: skip entries not assigned to this shard
+            if entry_shard_id is not None and entry_total_shards is not None:
+                if entry_index % entry_total_shards != entry_shard_id:
+                    continue
+
             batch.append((entry_index, log_entry))
 
             if len(batch) >= self.PARSE_BATCH_SIZE:
@@ -746,7 +1116,7 @@ class ClassicLogClient:
     async def _parse_batch(
         self, batch: List[tuple[int, LogEntry]]
     ) -> AsyncIterator[CertificateEntry]:
-        """Parse a batch of entries in parallel using thread pool."""
+        """Parse a batch of entries in parallel using process pool."""
         if not batch:
             return
 
@@ -759,34 +1129,59 @@ class ClassicLogClient:
                     yield entry
                 except Exception as e:
                     logger.warning(
-                        f"Error parsing classic entry {entry_index} from {self.log_meta.url}: {e}"
+                        f"Error parsing classic entry {entry_index} from "
+                        f"{self.log_meta.url}: {e}"
                     )
             return
 
         loop = asyncio.get_running_loop()
 
-        def parse_one(item: tuple[int, LogEntry]) -> Optional[CertificateEntry]:
-            entry_index, log_entry = item
-            try:
-                source = EntrySource(index=entry_index, log=self.log_meta)
-                return CertificateParser.parse_log_entry(log_entry, source)
-            except Exception as e:
-                logger.warning(
-                    f"Error parsing classic entry {entry_index} from {self.log_meta.url}: {e}"
-                )
-                return None
-
-        # Submit all parse tasks to thread pool
-        futures = [
-            loop.run_in_executor(self._executor, parse_one, item)
-            for item in batch
+        # Prepare args for multiprocessing (must be picklable)
+        mp_args = [
+            (
+                entry_index,
+                log_entry.timestamp,
+                int(log_entry.entry_type),
+                log_entry.entry,
+                self.log_meta.url,
+                self.log_meta.name,
+                self.log_meta.operator,
+            )
+            for entry_index, log_entry in batch
         ]
 
-        # Gather results preserving order
+        # Submit to process pool
+        futures = [
+            loop.run_in_executor(self._executor, _mp_parse_entry, args)
+            for args in mp_args
+        ]
+
         results = await asyncio.gather(*futures)
 
-        for entry in results:
-            if entry is not None:
+        # Convert results back to CertificateEntry
+        for result in results:
+            if result is not None:
+                (entry_index, timestamp, entry_type, domains, subject,
+                 issuer, not_before, not_after, serial, sha256_fp,
+                 sha1_fp, log_url, log_name, log_operator) = result
+
+                source = EntrySource(
+                    index=entry_index,
+                    log=LogMeta(url=log_url, name=log_name, operator=log_operator)
+                )
+                entry = CertificateEntry(
+                    timestamp=timestamp,
+                    entry_type=entry_type,
+                    source=source,
+                    domains=domains,
+                    subject=subject,
+                    issuer=issuer,
+                    not_before=not_before,
+                    not_after=not_after,
+                    serial_number=serial,
+                    fingerprint_sha256=sha256_fp,
+                    fingerprint_sha1=sha1_fp,
+                )
                 yield entry
 
     async def watch(
@@ -819,7 +1214,11 @@ class ClassicLogClient:
             loop = asyncio.get_running_loop()
             cycle_start = loop.time()
 
-            async for entry in self.fetch_entries(current_index + 1):
+            async for entry in self.fetch_entries(
+                current_index + 1,
+                entry_shard_id=self.shard_id,
+                entry_total_shards=self.total_shards,
+            ):
                 current_index = entry.source.index
                 yield entry
 
@@ -833,7 +1232,183 @@ class ClassicLogClient:
                 current_lag = -remaining_time
                 if current_lag > lag:
                     logger.warning(
-                        f"{int(time.time())}:{self._get_group_prefix()}Poll cycle for {self.log_meta.url} exceeded interval by {current_lag:.2f}s"
+                        f"{int(time.time())}:{self._get_group_prefix()}Poll cycle for "
+                        f"{self.log_meta.url} exceeded interval by {current_lag:.2f}s"
+                    )
+                lag = current_lag
+
+    async def _fetch_range_speculative(
+        self, start: int, end: int
+    ) -> List[tuple[int, LogEntry]]:
+        """
+        Fetch a range of entries speculatively (may return partial/empty).
+
+        Args:
+            start: Start index (inclusive)
+            end: End index (inclusive)
+
+        Returns:
+            List of (index, LogEntry) tuples. May be empty if range doesn't exist.
+        """
+        try:
+            entries = await self.get_entries(start, end)
+            return [(start + i, entry) for i, entry in enumerate(entries)]
+        except Exception:
+            # Range may not exist yet - that's fine for speculative fetching
+            return []
+
+    async def watch_raw(
+        self,
+        start_index: Optional[int] = None,
+        poll_interval: float = 30,
+        state: Optional[LogState] = None,
+    ) -> AsyncIterator[RawEntry]:
+        """
+        Continuously watch the log for new entries WITHOUT parsing.
+        Uses speculative parallel fetching with gap tracking.
+
+        Args:
+            start_index: Index to start from. If None, starts from current tree size
+            poll_interval: How often to poll for new entries (seconds)
+            state: Optional LogState for tracking gaps and progress. Updated in place.
+
+        Yields:
+            RawEntry objects (unparsed) as they are discovered
+        """
+        # Initialize state
+        if state is None:
+            state = LogState()
+
+        if start_index is not None:
+            state.current_index = start_index
+            state.highest_fetched = start_index
+
+        if state.current_index == 0 and state.highest_fetched == 0:
+            tree_size = await self.fetch_tree_size()
+            state.current_index = tree_size
+            state.highest_fetched = tree_size
+            await asyncio.sleep(poll_interval)
+
+        batch_size = self.RAW_BATCH_SIZE
+        n_parallel = self._parallel_fetches
+        lag: float = 0
+
+        # Convert gaps to failed ranges set: {(start, end), ...}
+        failed_ranges: set[tuple[int, int]] = set()
+        for gap_start, gap_end in state.gaps:
+            failed_ranges.add((gap_start, gap_end))
+
+        while True:
+            loop = asyncio.get_running_loop()
+            cycle_start = loop.time()
+
+            # Keep fetching until no new data
+            while True:
+                # Calculate ranges to fetch:
+                # 1. Failed ranges (gaps) starting at or after current_index
+                # 2. New ranges beyond highest_fetched
+                ranges_to_fetch: List[tuple[int, int]] = []
+
+                # Add failed ranges that we haven't passed yet
+                for fr_start, fr_end in sorted(failed_ranges):
+                    if fr_start > state.current_index and len(ranges_to_fetch) < n_parallel:
+                        ranges_to_fetch.append((fr_start, fr_end))
+
+                # Add new ranges beyond highest_fetched
+                next_start = state.highest_fetched + 1
+                while len(ranges_to_fetch) < n_parallel:
+                    next_end = next_start + batch_size - 1
+                    ranges_to_fetch.append((next_start, next_end))
+                    next_start = next_end + 1
+
+                if not ranges_to_fetch:
+                    break
+
+                # Fetch all ranges in parallel
+                results = await asyncio.gather(
+                    *[self._fetch_range_speculative(s, e) for s, e in ranges_to_fetch]
+                )
+
+                # Process results: track successes and failures
+                all_entries: List[tuple[int, LogEntry]] = []
+                newly_failed: set[tuple[int, int]] = set()
+                newly_succeeded: set[tuple[int, int]] = set()
+
+                for (range_start, range_end), range_results in zip(ranges_to_fetch, results):
+                    if range_results:
+                        # Success
+                        newly_succeeded.add((range_start, range_end))
+                        for entry_index, log_entry in range_results:
+                            if entry_index > state.current_index:
+                                all_entries.append((entry_index, log_entry))
+                    else:
+                        # Failed or empty - only mark as failed if within known range
+                        if range_start <= state.highest_fetched or (range_start, range_end) in failed_ranges:
+                            newly_failed.add((range_start, range_end))
+
+                # Update failed ranges
+                failed_ranges -= newly_succeeded
+                failed_ranges |= newly_failed
+
+                if not all_entries:
+                    break
+
+                # Sort entries by index
+                all_entries.sort(key=lambda x: x[0])
+
+                # Yield ALL successful entries immediately
+                max_entry_index = state.current_index
+                for entry_index, log_entry in all_entries:
+                    yield RawEntry(
+                        index=entry_index,
+                        timestamp=log_entry.timestamp,
+                        entry_type=int(log_entry.entry_type),
+                        cert_data=log_entry.entry,
+                        log_url=self.log_meta.url,
+                        log_name=self.log_meta.name,
+                        log_operator=self.log_meta.operator,
+                    )
+                    if entry_index > max_entry_index:
+                        max_entry_index = entry_index
+
+                # Update highest_fetched
+                if max_entry_index > state.highest_fetched:
+                    state.highest_fetched = max_entry_index
+
+                # Update current_index to highest contiguous point
+                new_current = state.current_index
+                while True:
+                    # Check if there's a gap starting right after new_current
+                    has_gap = False
+                    for gap_start, gap_end in failed_ranges:
+                        if gap_start == new_current + 1:
+                            has_gap = True
+                            break
+                    if has_gap:
+                        break
+                    # No gap, can we advance?
+                    if new_current >= state.highest_fetched:
+                        break
+                    # Advance by batch_size or to highest_fetched
+                    new_current = min(new_current + batch_size, state.highest_fetched)
+
+                state.current_index = new_current
+
+                # Update gaps in state
+                state.gaps = [[s, e] for s, e in sorted(failed_ranges)]
+
+            # Sleep for remaining poll interval
+            remaining_time = poll_interval - (loop.time() - cycle_start)
+
+            if remaining_time > 0:
+                await asyncio.sleep(remaining_time)
+                lag = 0
+            else:
+                current_lag = -remaining_time
+                if current_lag > lag:
+                    logger.warning(
+                        f"{int(time.time())}:{self._get_group_prefix()}Poll cycle for "
+                        f"{self.log_meta.url} exceeded interval by {current_lag:.2f}s"
                     )
                 lag = current_lag
 
@@ -926,10 +1501,13 @@ class CTMoniteur:
 
     def __init__(
         self,
-        callback: Union[
+        callback: Optional[Union[
             Callable[[CertificateEntry], None], Callable[[CertificateEntry], asyncio.Future]
-        ],
-        initial_state: Optional[Dict[str, int]] = None,
+        ]] = None,
+        raw_callback: Optional[Union[
+            Callable[[RawEntry], None], Callable[[RawEntry], asyncio.Future]
+        ]] = None,
+        initial_state: Optional[Dict[str, Any]] = None,
         skip_retired: bool = True,
         poll_interval: float = 30,
         timeout: float = 30.0,
@@ -944,12 +1522,16 @@ class CTMoniteur:
         shard_id: Optional[int] = None,
         total_shards: Optional[int] = None,
         parse_workers: int = 4,
+        log_prefix: Optional[str] = None,
+        parallel_fetches: int = 1,
     ):
         """
         Initialize CT Moniteur.
 
         Args:
-            callback: Function to call for each certificate entry (can be sync or async)
+            callback: Function to call for each parsed certificate entry
+            raw_callback: Function to call for each raw (unparsed) entry.
+                         When set, skips parsing - used for fetcher->parser architecture
             initial_state: Optional dict of {log_url: last_index} to resume from
             skip_retired: Skip retired logs
             poll_interval: How often to poll for new entries (seconds)
@@ -964,9 +1546,14 @@ class CTMoniteur:
             exclude_logs: Skip logs matching these patterns (partial URL match)
             shard_id: This instance's shard ID (0 to total_shards-1)
             total_shards: Total number of shards for distributed processing
-            parse_workers: Number of threads for parallel certificate parsing
+            parse_workers: Number of threads for parallel certificate parsing (ignored in raw mode)
+            log_prefix: Custom prefix for log messages (e.g. "fetcher")
+            parallel_fetches: Number of parallel batch fetches per log (for raw mode)
         """
+        if callback is None and raw_callback is None:
+            raise ValueError("Either callback or raw_callback must be provided")
         self.callback = callback
+        self.raw_callback = raw_callback
         self.skip_retired = skip_retired
         self.poll_interval = poll_interval
         self.timeout = timeout
@@ -979,8 +1566,14 @@ class CTMoniteur:
         self.shard_id = shard_id
         self.total_shards = total_shards
         self.parse_workers = parse_workers
+        self.log_prefix = log_prefix
+        self.parallel_fetches = parallel_fetches
 
-        self._state: Dict[str, int] = initial_state or {}
+        # Parse initial state into LogState objects
+        self._state: Dict[str, LogState] = {}
+        if initial_state:
+            for url, state_data in initial_state.items():
+                self._state[url] = LogState.from_dict(state_data)
         self._clients: List[Union[TiledLogClient, ClassicLogClient]] = []
         self._tasks: List[asyncio.Task] = []
         self._running = False
@@ -992,7 +1585,7 @@ class CTMoniteur:
             shard_id=shard_id,
         )
         self._refresh_task: Optional[asyncio.Task] = None
-        self._executor: Optional[ThreadPoolExecutor] = None
+        self._executor: Optional[ProcessPoolExecutor] = None
 
     async def start(self) -> None:
         """
@@ -1007,9 +1600,9 @@ class CTMoniteur:
         self._running = True
         self._stats.start_time = datetime.utcnow()
 
-        # Create thread pool for parallel certificate parsing
+        # Create process pool for parallel certificate parsing (bypasses GIL)
         if self.parse_workers > 0:
-            self._executor = ThreadPoolExecutor(max_workers=self.parse_workers)
+            self._executor = ProcessPoolExecutor(max_workers=self.parse_workers)
 
         self._clients = await self._create_clients()
         self._stats.active_logs = len(self._clients)
@@ -1045,12 +1638,15 @@ class CTMoniteur:
 
         logger.info("CT Moniteur stopped")
 
-    def get_state(self) -> Dict[str, int]:
+    def get_state(self) -> Dict[str, Any]:
         """
         Get current monitoring state.
 
         Returns:
-            Dictionary mapping log URLs to last processed index
+            Dictionary mapping log URLs to state dict with:
+            - current_index: Highest contiguous index (safe restart point)
+            - highest_fetched: Highest index successfully fetched
+            - gaps: List of [start, end] ranges that failed
 
         Example:
             state = monitor.get_state()
@@ -1058,7 +1654,7 @@ class CTMoniteur:
             with open('ct_state.json', 'w') as f:
                 json.dump(state, f)
         """
-        return self._state.copy()
+        return {url: state.to_dict() for url, state in self._state.items()}
 
     def get_stats(self) -> MoniteurStats:
         """Get monitoring statistics."""
@@ -1132,14 +1728,27 @@ class CTMoniteur:
             by_host[hostname].sort(key=lambda x: x["url"])
 
         # Assign shards based on hostname+path hash (stable when new logs added)
+        # Exception: if include_logs targets specific logs (not domains), use
+        # entry-level sharding instead of URL-based sharding
+        use_entry_sharding = (
+            self.include_logs and
+            all(".com" not in p and ".org" not in p for p in self.include_logs)
+        )
+
+        # shard_id always passed for log prefix display
+        # total_shards only passed for entry-level sharding (controls filtering)
+        client_shard_id = self.shard_id
+        client_total_shards = self.total_shards if use_entry_sharding else None
+
         clients: List[Union[TiledLogClient, ClassicLogClient]] = []
         for hostname, logs in by_host.items():
             for log in logs:
-                # Skip if sharding enabled and not our shard
+                # Skip if sharding enabled and not our shard (unless entry-sharding)
                 if self.shard_id is not None and self.total_shards is not None:
-                    shard = self._get_shard_for_url(log["url"])
-                    if shard != self.shard_id:
-                        continue
+                    if not use_entry_sharding:
+                        shard = self._get_shard_for_url(log["url"])
+                        if shard != self.shard_id:
+                            continue
 
                 log_meta = LogMeta(
                     url=log["url"],
@@ -1153,8 +1762,11 @@ class CTMoniteur:
                         timeout=self.timeout,
                         user_agent=self.user_agent,
                         transport=self._transport,
-                        shard_id=self.shard_id,
+                        shard_id=client_shard_id,
+                        total_shards=client_total_shards,
                         executor=self._executor,
+                        log_prefix=self.log_prefix,
+                        parallel_fetches=self.parallel_fetches,
                     )
                 else:
                     client = TiledLogClient(
@@ -1162,8 +1774,11 @@ class CTMoniteur:
                         timeout=self.timeout,
                         user_agent=self.user_agent,
                         transport=self._transport,
-                        shard_id=self.shard_id,
+                        shard_id=client_shard_id,
+                        total_shards=client_total_shards,
                         executor=self._executor,
+                        log_prefix=self.log_prefix,
+                        parallel_fetches=self.parallel_fetches,
                     )
                 clients.append(client)
 
@@ -1186,43 +1801,92 @@ class CTMoniteur:
             await asyncio.sleep(initial_delay)
 
         retries = 0
-        start_index = self._state.get(client.log_meta.url)
+        log_url = client.log_meta.url
+
+        # Get or create LogState for this log
+        log_state = self._state.get(log_url)
+        if log_state is None:
+            log_state = LogState()
+            self._state[log_url] = log_state
+
+        # For backwards compat: start_index only used for non-raw mode
+        start_index = log_state.current_index if log_state.current_index > 0 else None
+
+        # Use raw mode if raw_callback is set (skips parsing)
+        use_raw_mode = self.raw_callback is not None
 
         while self._running:
             try:
-                async for entry in client.watch(
-                    start_index=start_index, poll_interval=self.poll_interval
-                ):
-                    if not self._running:
-                        break
+                if use_raw_mode:
+                    # Raw mode: fetch without parsing, call raw_callback
+                    # Pass log_state which is updated in-place by watch_raw
+                    async for raw_entry in client.watch_raw(
+                        poll_interval=self.poll_interval,
+                        state=log_state,
+                    ):
+                        if not self._running:
+                            break
 
-                    # Update state
-                    async with self._state_lock:
-                        self._state[entry.source.log.url] = entry.source.index
-                        self._stats.total_entries_processed += 1
-                        self._stats.entries_per_log[entry.source.log.url] = (
-                            self._stats.entries_per_log.get(entry.source.log.url, 0) + 1
-                        )
+                        # Update stats (state is updated in-place by watch_raw)
+                        async with self._state_lock:
+                            self._stats.total_entries_processed += 1
+                            self._stats.entries_per_log[raw_entry.log_url] = (
+                                self._stats.entries_per_log.get(raw_entry.log_url, 0) + 1
+                            )
 
-                    start_index = entry.source.index
+                        # Reset retries on successful entry processing
+                        if retries > 0:
+                            logger.info(
+                                f"Log {raw_entry.log_url} recovered after {retries} failed attempt(s)"
+                            )
+                            retries = 0
 
-                    # Reset retries on successful entry processing
-                    if retries > 0:
-                        logger.info(
-                            f"Log {client.log_meta.url} recovered after {retries} failed attempt(s)"
-                        )
-                        retries = 0
+                        # Call raw callback
+                        try:
+                            if asyncio.iscoroutinefunction(self.raw_callback):
+                                await self.raw_callback(raw_entry)
+                            else:
+                                self.raw_callback(raw_entry)
+                        except Exception as e:
+                            logger.error(
+                                f"Error in raw_callback for {raw_entry.log_url}: {e}", exc_info=True
+                            )
+                else:
+                    # Normal mode: fetch with parsing, call callback
+                    async for entry in client.watch(
+                        start_index=start_index, poll_interval=self.poll_interval
+                    ):
+                        if not self._running:
+                            break
 
-                    # Call user callback
-                    try:
-                        if asyncio.iscoroutinefunction(self.callback):
-                            await self.callback(entry)
-                        else:
-                            self.callback(entry)
-                    except Exception as e:
-                        logger.error(
-                            f"Error in callback for {entry.source.log.url}: {e}", exc_info=True
-                        )
+                        # Update state (non-raw mode uses simple index tracking)
+                        async with self._state_lock:
+                            log_state.current_index = entry.source.index
+                            log_state.highest_fetched = entry.source.index
+                            self._stats.total_entries_processed += 1
+                            self._stats.entries_per_log[entry.source.log.url] = (
+                                self._stats.entries_per_log.get(entry.source.log.url, 0) + 1
+                            )
+
+                        start_index = entry.source.index
+
+                        # Reset retries on successful entry processing
+                        if retries > 0:
+                            logger.info(
+                                f"Log {log_url} recovered after {retries} failed attempt(s)"
+                            )
+                            retries = 0
+
+                        # Call user callback
+                        try:
+                            if asyncio.iscoroutinefunction(self.callback):
+                                await self.callback(entry)
+                            else:
+                                self.callback(entry)
+                        except Exception as e:
+                            logger.error(
+                                f"Error in callback for {entry.source.log.url}: {e}", exc_info=True
+                            )
 
             except asyncio.CancelledError:
                 break

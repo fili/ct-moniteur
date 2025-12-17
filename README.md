@@ -21,6 +21,10 @@ This library is an independent project and is not an official product. It is pro
 - **Connection pool tuning** - Configure max connections and keepalive
 - **Log filtering** - Include/exclude logs by URL patterns
 - **Sharding support** - Distribute logs across multiple instances
+- **Raw mode** - Fetcher-parser architecture for high-volume logs
+- **Parallel parsing** - ProcessPoolExecutor for CPU-bound certificate parsing
+- **Gap tracking** - Failed ranges tracked and retried, no data loss on transient errors
+- **Extended state** - Per-log state with current_index, highest_fetched, and gaps
 
 ## Installation
 
@@ -276,6 +280,63 @@ monitor = CTMoniteur(
 )
 ```
 
+## Raw Mode (Fetcher-Parser Architecture)
+
+For high-volume logs, separate network I/O from CPU-bound parsing using raw mode:
+
+```python
+from ct_moniteur import CTMoniteur, RawEntry
+
+def on_raw_entry(raw: RawEntry):
+    """Receive raw certificate data without parsing"""
+    # Push to queue for separate parser workers
+    queue.push({
+        "index": raw.index,
+        "timestamp": raw.timestamp,
+        "entry_type": raw.entry_type,  # 0=X509, 1=Precert
+        "cert_data": raw.cert_data,    # DER-encoded bytes
+        "log_url": raw.log_url,
+        "log_name": raw.log_name,
+        "log_operator": raw.log_operator
+    })
+
+# Fetcher: only fetch, no parsing
+monitor = CTMoniteur(
+    raw_callback=on_raw_entry,
+    include_logs=["argon", "xenon"],
+    log_prefix="fetcher",     # Shows as "fetcher:" in log messages
+    parallel_fetches=8,       # 8 parallel batch requests per log
+)
+```
+
+**Why use raw mode:**
+- Parsing is CPU-bound (GIL contention in Python)
+- Network I/O and parsing can be scaled independently
+- Single fetcher → queue → N parser workers
+- Adding parser workers actually helps (vs entry-level sharding where each shard fetches everything)
+- `parallel_fetches` reduces latency by having multiple requests in flight (within connection pool limits)
+
+**Gap tracking (raw mode):**
+- Speculative parallel fetching may have some requests fail (transient errors, rate limits)
+- Failed ranges are tracked as "gaps" and retried on subsequent iterations
+- Successful entries are yielded immediately (no caching needed - they're processed)
+- `current_index` only advances when entries are contiguous (safe restart point)
+- `highest_fetched` tracks how far ahead we've fetched
+- CT logs are append-only/immutable, so failed ranges can safely be retried later
+
+### Parallel Parsing (In-Process)
+
+For moderate volume, use in-process parallel parsing with ProcessPoolExecutor:
+
+```python
+monitor = CTMoniteur(
+    callback=process_certificate,
+    parse_workers=4  # Parse certificates in parallel (0=sequential)
+)
+```
+
+**Note:** `parse_workers` uses ProcessPoolExecutor to bypass GIL. Good for moderate volume, but for very high volume logs, raw mode with separate parser workers scales better.
+
 ## API Reference
 
 ### CTMoniteur
@@ -285,10 +346,11 @@ Main class for monitoring all CT logs.
 **Constructor:**
 ```python
 CTMoniteur(
-    callback: Callable,              # Function to process each entry (sync or async)
-    initial_state: Dict[str, int],   # Optional: {log_url: last_index}
+    callback: Callable = None,       # Function to process parsed entries (sync or async)
+    raw_callback: Callable = None,   # Function to process raw entries (no parsing)
+    initial_state: Dict[str, Any],   # Optional: {log_url: LogState dict or int}
     skip_retired: bool = True,       # Skip retired logs
-    poll_interval: float = 15.0,     # Polling interval in seconds
+    poll_interval: float = 30.0,     # Polling interval in seconds
     timeout: float = 30.0,           # HTTP timeout
     user_agent: str = None,          # Custom user agent
     max_retries: int = 3,            # Max retries per log
@@ -300,13 +362,18 @@ CTMoniteur(
     exclude_logs: List[str] = None,  # Exclude logs matching patterns
     shard_id: int = None,            # Shard ID for distributed processing
     total_shards: int = None,        # Total number of shards
+    parse_workers: int = 0,          # Parallel parsing processes (0=sequential)
+    log_prefix: str = None,          # Custom prefix for log messages (e.g. "fetcher")
+    parallel_fetches: int = 1,       # Parallel batch fetches per log (raw mode)
 )
 ```
+
+**Note:** Provide either `callback` (parsed entries) or `raw_callback` (raw entries), not both.
 
 **Methods:**
 - `start()` - Start monitoring all logs
 - `stop()` - Stop monitoring gracefully
-- `get_state()` - Get current state (dict of log_url -> index)
+- `get_state()` - Get current state (dict of log_url -> {current_index, highest_fetched, gaps})
 - `get_stats()` - Get monitoring statistics
 
 ### CertificateEntry
@@ -331,7 +398,31 @@ Each certificate entry contains:
 - `fingerprint_sha256` - SHA-256 fingerprint
 - `fingerprint_sha1` - SHA-1 fingerprint
 
-### MonitorStats
+### RawEntry
+
+Raw certificate entry (used with `raw_callback`):
+
+- `index` - Entry index in the log
+- `timestamp` - Entry timestamp (milliseconds)
+- `entry_type` - 0 for X509LogEntry, 1 for PrecertLogEntry
+- `cert_data` - DER-encoded certificate bytes
+- `log_url` - Source CT log URL
+- `log_name` - Source CT log name
+- `log_operator` - Log operator name
+
+### LogState
+
+Extended state for a single CT log with gap tracking:
+
+- `current_index` - Highest contiguous index (safe restart point)
+- `highest_fetched` - Highest index successfully fetched
+- `gaps` - List of [start, end] ranges that failed and need retry
+
+**Methods:**
+- `to_dict()` - Convert to dictionary for serialization
+- `from_dict(data)` - Create from dictionary (handles backwards compat with int)
+
+### MoniteurStats
 
 Statistics tracked during monitoring:
 
@@ -343,29 +434,42 @@ Statistics tracked during monitoring:
 
 ## State File Format
 
-The state is a simple JSON dictionary:
+The state is a JSON dictionary with extended per-log tracking:
 
 ```json
 {
-  "https://ct.googleapis.com/logs/argon2024": 12345678,
-  "https://oak.ct.letsencrypt.org/2024h1": 87654321,
-  ...
+  "https://ct.googleapis.com/logs/argon2024": {
+    "current_index": 12345678,
+    "highest_fetched": 12345800,
+    "gaps": []
+  },
+  "https://oak.ct.letsencrypt.org/2024h1": {
+    "current_index": 87654321,
+    "highest_fetched": 87654500,
+    "gaps": [[87654400, 87654450]]
+  }
 }
 ```
 
-Each key is a log URL, and the value is the last processed index.
+Each log URL maps to a state object with:
+- `current_index` - Highest contiguous index (safe restart point)
+- `highest_fetched` - Highest index successfully fetched
+- `gaps` - List of [start, end] ranges that failed and need retry
+
+**Backwards compatibility:** Old state format (just an integer) is automatically converted.
 
 ## Performance Considerations
 
-- The library monitors ~250 logs concurrently using asyncio
+- The library monitors ~71 active CT logs concurrently using asyncio
 - Use async callbacks for I/O operations (database, API calls)
-- Save state periodically (every 30-60 seconds) to avoid data loss
+- Save state periodically (every 15 minutes) - state includes gap tracking for recovery
 - Consider filtering certificates in the callback to reduce processing load
 - Logs are polled with staggered delays to avoid request bursts
-- Poll cycle warnings include Unix timestamp and shard_id prefix for debugging:
+- Poll cycle warnings include Unix timestamp and prefix for debugging:
   ```
-  1765798677:shard3:Poll cycle for https://ct.googleapis.com/logs/us1/argon2026h1/ exceeded interval by 12.42s
+  1765798677:fetcher-google:Poll cycle for https://ct.googleapis.com/logs/us1/argon2026h1/ exceeded interval by 12.42s
   ```
+- Gap tracking ensures no data loss on transient errors or restarts
 
 ## License
 
