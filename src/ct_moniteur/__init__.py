@@ -7,6 +7,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -247,6 +248,11 @@ class TiledLogClient:
         self.log_meta = log_meta
         self.timeout = timeout
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
+        # Skylight requires contact info in User-Agent
+        # https://github.com/FiloSottile/sunlight/blob/main/cmd/skylight/skylight.go#L175
+        skylight_contact = os.environ.get("MONITEUR_SKYLIGHT_CONTACT")
+        if skylight_contact and "skylight" in log_meta.url.lower():
+            self.user_agent = f"{self.user_agent} ({skylight_contact})"
         self.shard_id = shard_id
         self.total_shards = total_shards
         self._executor = executor
@@ -878,6 +884,11 @@ class ClassicLogClient:
         self.log_meta = log_meta
         self.timeout = timeout
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
+        # Skylight requires contact info in User-Agent
+        # https://github.com/FiloSottile/sunlight/blob/main/cmd/skylight/skylight.go#L175
+        skylight_contact = os.environ.get("MONITEUR_SKYLIGHT_CONTACT")
+        if skylight_contact and "skylight" in log_meta.url.lower():
+            self.user_agent = f"{self.user_agent} ({skylight_contact})"
         self.shard_id = shard_id
         self.total_shards = total_shards
         self._executor = executor

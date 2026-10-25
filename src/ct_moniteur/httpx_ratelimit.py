@@ -17,6 +17,7 @@ class HostData:
     first_request_time: Optional[float] = None
     request_count: int = 0
     rate_limit: Optional[float] = None
+    last_request_time: float = 0.0
 
 
 class RateLimitedTransport(httpx.AsyncHTTPTransport):
@@ -54,7 +55,21 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
             attempt += 1
 
             host_data = self._get_host_data(host)
+
+            # Proactive rate limiting: calculate wait outside lock
+            wait_time = 0.0
             async with host_data.lock:
+                if host_data.rate_limit is not None:
+                    min_interval = 1.0 / host_data.rate_limit
+                    elapsed = time.monotonic() - host_data.last_request_time
+                    if elapsed < min_interval:
+                        wait_time = min_interval - elapsed
+                        host_data.last_request_time += min_interval
+                    else:
+                        host_data.last_request_time = time.monotonic()
+                else:
+                    host_data.last_request_time = time.monotonic()
+
                 if host_data.first_request_time is None:
                     host_data.first_request_time = time.monotonic()
                 host_data.request_count += 1
@@ -70,6 +85,10 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                     host_data.first_request_time = None
                     host_data.request_count = 0
 
+            # Sleep outside lock
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+
             response = await super().handle_async_request(request)
 
             if response.status_code == 429:
@@ -78,14 +97,25 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                     if host_data.first_request_time:
                         elapsed = time.monotonic() - host_data.first_request_time
                         if elapsed > 0 and host_data.request_count > 1:
-                            host_data.rate_limit = (host_data.request_count - 1) / elapsed
+                            # Use 50% of observed rate as safety margin
+                            raw_rate = (host_data.request_count - 1) / elapsed
+                            host_data.rate_limit = raw_rate * 0.5
                             logger.info(
-                                f"{int(time.time())}:{self._shard_prefix}[{host}] Rate limit learned: "
-                                f"{host_data.rate_limit:.2f} req/s"
+                                f"{int(time.time())}:{self._shard_prefix}[{host}] "
+                                f"Rate limit learned: {host_data.rate_limit:.2f} req/s "
+                                f"(raw: {raw_rate:.2f})"
                             )
                             default_retry_after = min(1.0 / host_data.rate_limit, 10.0)
                         else:
                             default_retry_after = 5.0
+                    elif host_data.rate_limit is not None:
+                        # Already rate limited but still got 429 - halve the rate
+                        host_data.rate_limit *= 0.5
+                        logger.info(
+                            f"{int(time.time())}:{self._shard_prefix}[{host}] "
+                            f"Rate limit reduced to: {host_data.rate_limit:.2f} req/s"
+                        )
+                        default_retry_after = min(1.0 / host_data.rate_limit, 10.0)
                     else:
                         default_retry_after = 5.0
 
