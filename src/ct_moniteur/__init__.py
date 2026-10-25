@@ -1259,14 +1259,24 @@ class ClassicLogClient:
             end: End index (inclusive)
 
         Returns:
-            List of (index, LogEntry) tuples. May be empty if range doesn't exist.
+            Contiguous (index, LogEntry) tuples from start. May be shorter
+            than the range (log end or error) or empty.
         """
+        results: List[tuple[int, LogEntry]] = []
+        pos = start
         try:
-            entries = await self.get_entries(start, end)
-            return [(start + i, entry) for i, entry in enumerate(entries)]
+            # Logs may return fewer entries than requested (RFC 6962 4.6;
+            # Google caps at 32), so keep asking until the range is filled.
+            while pos <= end:
+                entries = await self.get_entries(pos, end)
+                if not entries:
+                    break
+                results.extend((pos + i, e) for i, e in enumerate(entries))
+                pos += len(entries)
         except Exception:
             # Range may not exist yet - that's fine for speculative fetching
-            return []
+            pass
+        return results
 
     async def watch_raw(
         self,
@@ -1345,16 +1355,26 @@ class ClassicLogClient:
                 newly_failed: set[tuple[int, int]] = set()
                 newly_succeeded: set[tuple[int, int]] = set()
 
+                # Anything short of the highest entry seen in this batch is
+                # a hole, not the log's end, and must be retried.
+                batch_max = max(
+                    [state.highest_fetched]
+                    + [r[-1][0] for r in results if r]
+                )
+
                 for (range_start, range_end), range_results in zip(ranges_to_fetch, results):
                     if range_results:
-                        # Success
+                        # Success (possibly partial)
                         newly_succeeded.add((range_start, range_end))
                         for entry_index, log_entry in range_results:
                             if entry_index > state.current_index:
                                 all_entries.append((entry_index, log_entry))
+                        fetched_end = range_results[-1][0]
+                        if fetched_end < range_end and fetched_end < batch_max:
+                            newly_failed.add((fetched_end + 1, range_end))
                     else:
                         # Failed or empty - only mark as failed if within known range
-                        if range_start <= state.highest_fetched or (range_start, range_end) in failed_ranges:
+                        if range_start <= batch_max or (range_start, range_end) in failed_ranges:
                             newly_failed.add((range_start, range_end))
 
                 # Update failed ranges
@@ -1386,24 +1406,17 @@ class ClassicLogClient:
                 if max_entry_index > state.highest_fetched:
                     state.highest_fetched = max_entry_index
 
-                # Update current_index to highest contiguous point
-                new_current = state.current_index
-                while True:
-                    # Check if there's a gap starting right after new_current
-                    has_gap = False
-                    for gap_start, gap_end in failed_ranges:
-                        if gap_start == new_current + 1:
-                            has_gap = True
-                            break
-                    if has_gap:
-                        break
-                    # No gap, can we advance?
-                    if new_current >= state.highest_fetched:
-                        break
-                    # Advance by batch_size or to highest_fetched
-                    new_current = min(new_current + batch_size, state.highest_fetched)
+                # Update current_index to highest contiguous point: just below
+                # the lowest open gap. Stepping by batch_size only stopped on
+                # gaps aligned to that step and skipped the rest.
+                open_gaps = [
+                    s for s, _ in failed_ranges if s > state.current_index
+                ]
+                new_current = state.highest_fetched
+                if open_gaps:
+                    new_current = min(new_current, min(open_gaps) - 1)
 
-                state.current_index = new_current
+                state.current_index = max(state.current_index, new_current)
 
                 # Update gaps in state
                 state.gaps = [[s, e] for s, e in sorted(failed_ranges)]

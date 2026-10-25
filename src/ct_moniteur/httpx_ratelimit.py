@@ -18,6 +18,15 @@ class HostData:
     request_count: int = 0
     rate_limit: Optional[float] = None
     last_request_time: float = 0.0
+    last_reduced: float = 0.0
+
+
+# A burst of parallel requests gets a burst of 429s for the same overload;
+# reducing on each one collapsed the rate to ~0 and it never recovered.
+# AIMD instead: cut at most once per window, probe back up while healthy.
+REDUCE_WINDOW = 10.0
+RATE_INCREASE = 1.1
+MIN_RATE = 1.0
 
 
 class RateLimitedTransport(httpx.AsyncHTTPTransport):
@@ -82,6 +91,8 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                             f"{int(time.time())}:{self._shard_prefix}[{host}] Rate stats: "
                             f"{host_data.request_count} reqs in {elapsed:.2f}s ({actual_rate:.2f} req/s)"
                         )
+                    if host_data.rate_limit is not None:
+                        host_data.rate_limit *= RATE_INCREASE
                     host_data.first_request_time = None
                     host_data.request_count = 0
 
@@ -94,12 +105,22 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
             if response.status_code == 429:
                 host_data = self._get_host_data(host)
                 async with host_data.lock:
-                    if host_data.first_request_time:
+                    now = time.monotonic()
+                    recently_reduced = (
+                        host_data.rate_limit is not None
+                        and now - host_data.last_reduced < REDUCE_WINDOW
+                    )
+                    if recently_reduced:
+                        default_retry_after = min(
+                            1.0 / host_data.rate_limit, 10.0
+                        )
+                    elif host_data.first_request_time:
                         elapsed = time.monotonic() - host_data.first_request_time
                         if elapsed > 0 and host_data.request_count > 1:
                             # Use 50% of observed rate as safety margin
                             raw_rate = (host_data.request_count - 1) / elapsed
-                            host_data.rate_limit = raw_rate * 0.5
+                            host_data.rate_limit = max(raw_rate * 0.5, MIN_RATE)
+                            host_data.last_reduced = now
                             logger.info(
                                 f"{int(time.time())}:{self._shard_prefix}[{host}] "
                                 f"Rate limit learned: {host_data.rate_limit:.2f} req/s "
@@ -110,7 +131,10 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                             default_retry_after = 5.0
                     elif host_data.rate_limit is not None:
                         # Already rate limited but still got 429 - halve the rate
-                        host_data.rate_limit *= 0.5
+                        host_data.rate_limit = max(
+                            host_data.rate_limit * 0.5, MIN_RATE
+                        )
+                        host_data.last_reduced = now
                         logger.info(
                             f"{int(time.time())}:{self._shard_prefix}[{host}] "
                             f"Rate limit reduced to: {host_data.rate_limit:.2f} req/s"
