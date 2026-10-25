@@ -725,11 +725,12 @@ class TiledLogClient:
             state.current_index = start_index
             state.highest_fetched = start_index
 
+        # No position yet: start at entry 0, not the tree head. Jumping to
+        # the head silently skipped every entry a log already held when we
+        # first saw it (frozen Sectigo logs: their whole content).
         if state.current_index == 0 and state.highest_fetched == 0:
-            tree_size = await self.fetch_tree_size()
-            state.current_index = tree_size
-            state.highest_fetched = tree_size
-            await asyncio.sleep(poll_interval)
+            state.current_index = -1
+            state.highest_fetched = -1
 
         n_parallel = self._parallel_fetches
         lag: float = 0
@@ -1304,11 +1305,12 @@ class ClassicLogClient:
             state.current_index = start_index
             state.highest_fetched = start_index
 
+        # No position yet: start at entry 0, not the tree head. Jumping to
+        # the head silently skipped every entry a log already held when we
+        # first saw it (frozen Sectigo logs: their whole content).
         if state.current_index == 0 and state.highest_fetched == 0:
-            tree_size = await self.fetch_tree_size()
-            state.current_index = tree_size
-            state.highest_fetched = tree_size
-            await asyncio.sleep(poll_interval)
+            state.current_index = -1
+            state.highest_fetched = -1
 
         batch_size = self.RAW_BATCH_SIZE
         n_parallel = self._parallel_fetches
@@ -1549,6 +1551,8 @@ class CTMoniteur:
         log_prefix: Optional[str] = None,
         parallel_fetches: int = 1,
         proxies: Optional[List[str]] = None,
+        extra_logs: Optional[List[Dict[str, str]]] = None,
+        min_rate: Optional[float] = None,
     ):
         """
         Initialize CT Moniteur.
@@ -1576,6 +1580,10 @@ class CTMoniteur:
             parallel_fetches: Number of parallel batch fetches per log (for raw mode)
             proxies: HTTP proxy URLs to spread requests over, alongside the
                 direct connection (for logs that rate limit per source IP)
+            extra_logs: [{"url": ..., "type": "classic"|"tiled"}] to watch
+                even when missing from the log list (still subject to
+                include/exclude)
+            min_rate: floor (req/s per egress IP) for learned rate limits
         """
         if callback is None and raw_callback is None:
             raise ValueError("Either callback or raw_callback must be provided")
@@ -1595,6 +1603,7 @@ class CTMoniteur:
         self.parse_workers = parse_workers
         self.log_prefix = log_prefix
         self.parallel_fetches = parallel_fetches
+        self.extra_logs = extra_logs or []
 
         # Parse initial state into LogState objects
         self._state: Dict[str, LogState] = {}
@@ -1613,6 +1622,7 @@ class CTMoniteur:
                 max_keepalive_connections=max_keepalive_connections,
                 shard_id=shard_id,
                 proxy=proxy,
+                **({"min_rate": min_rate} if min_rate else {}),
             )
             for proxy in egress
         ]
@@ -1771,6 +1781,19 @@ class CTMoniteur:
                         "type": "tiled",
                     })
 
+        # Expired logs drop off the list while still serving their entries,
+        # so a backlog in one would otherwise never be fetched.
+        listed = {log["url"] for log in all_logs}
+        for extra in self.extra_logs:
+            url = extra["url"]
+            if url not in listed and self._should_include_log(url):
+                all_logs.append({
+                    "url": url,
+                    "description": url,
+                    "operator": "unlisted",
+                    "type": extra["type"],
+                })
+
         # Group by hostname and sort for deterministic ordering
         by_host: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for log in all_logs:
@@ -1862,8 +1885,9 @@ class CTMoniteur:
             log_state = LogState()
             self._state[log_url] = log_state
 
-        # For backwards compat: start_index only used for non-raw mode
-        start_index = log_state.current_index if log_state.current_index > 0 else None
+        # Non-raw mode only. -1 (entry 0) for a log without a position: None
+        # would start at the tree head and skip what the log already holds.
+        start_index = log_state.current_index if log_state.current_index > 0 else -1
 
         # Use raw mode if raw_callback is set (skips parsing)
         use_raw_mode = self.raw_callback is not None

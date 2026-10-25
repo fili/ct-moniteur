@@ -49,6 +49,7 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
         max_connections: int = 100,
         max_keepalive_connections: int = 20,
         shard_id: Optional[int] = None,
+        min_rate: float = MIN_RATE,
         **kwargs
     ):
         super().__init__(
@@ -60,6 +61,10 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
         )
         self._host_data: dict[str, HostData] = {}
         self._shard_id = shard_id
+        # Logs that shed load at random (TrustAsia: ~50% 429 even at
+        # 0.3 req/s from idle IPs) drive any limiter to the floor without
+        # reducing their 429s, so such fetchers set a higher floor.
+        self._min_rate = min_rate
         self._shard_prefix = f"shard{shard_id}:" if shard_id is not None else ""
         # Limits are per egress IP, so say which one a message is about
         if kwargs.get("proxy"):
@@ -148,7 +153,7 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                         if elapsed > 0 and host_data.request_count > 1:
                             # Use 50% of observed rate as safety margin
                             raw_rate = (host_data.request_count - 1) / elapsed
-                            host_data.rate_limit = max(raw_rate * 0.5, MIN_RATE)
+                            host_data.rate_limit = max(raw_rate * 0.5, self._min_rate)
                             host_data.last_reduced = now
                             logger.warning(
                                 f"{int(time.time())}:{self._shard_prefix}[{host}] "
@@ -161,7 +166,7 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                     elif host_data.rate_limit is not None:
                         # Already rate limited but still got 429 - halve the rate
                         host_data.rate_limit = max(
-                            host_data.rate_limit * RATE_DECREASE, MIN_RATE
+                            host_data.rate_limit * RATE_DECREASE, self._min_rate
                         )
                         host_data.last_reduced = now
                         logger.warning(
