@@ -20,7 +20,7 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 
 from .binary_reader import BinaryReader, DataType, Endianness
-from .httpx_ratelimit import RateLimitedTransport
+from .httpx_ratelimit import PooledTransport, RateLimitedTransport
 
 __version__ = "1.0.0"
 
@@ -1548,6 +1548,7 @@ class CTMoniteur:
         parse_workers: int = 4,
         log_prefix: Optional[str] = None,
         parallel_fetches: int = 1,
+        proxies: Optional[List[str]] = None,
     ):
         """
         Initialize CT Moniteur.
@@ -1573,6 +1574,8 @@ class CTMoniteur:
             parse_workers: Number of threads for parallel certificate parsing (ignored in raw mode)
             log_prefix: Custom prefix for log messages (e.g. "fetcher")
             parallel_fetches: Number of parallel batch fetches per log (for raw mode)
+            proxies: HTTP proxy URLs to spread requests over, alongside the
+                direct connection (for logs that rate limit per source IP)
         """
         if callback is None and raw_callback is None:
             raise ValueError("Either callback or raw_callback must be provided")
@@ -1603,10 +1606,19 @@ class CTMoniteur:
         self._running = False
         self._stats = MoniteurStats()
         self._state_lock = asyncio.Lock()
-        self._transport = RateLimitedTransport(
-            max_connections=max_connections,
-            max_keepalive_connections=max_keepalive_connections,
-            shard_id=shard_id,
+        egress = [None] + list(proxies or [])
+        transports = [
+            RateLimitedTransport(
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+                shard_id=shard_id,
+                proxy=proxy,
+            )
+            for proxy in egress
+        ]
+        self._transport: httpx.AsyncBaseTransport = (
+            transports[0] if len(transports) == 1
+            else PooledTransport(transports)
         )
         self._refresh_task: Optional[asyncio.Task] = None
         self._executor: Optional[ProcessPoolExecutor] = None
@@ -1683,6 +1695,23 @@ class CTMoniteur:
     def get_stats(self) -> MoniteurStats:
         """Get monitoring statistics."""
         return self._stats
+
+    async def get_backlog(self) -> Dict[str, int]:
+        """Entries per log between the safe restart point and the tree size.
+
+        Logs whose tree size can't be fetched are left out.
+        """
+        async def one(client: Union[TiledLogClient, ClassicLogClient]):
+            try:
+                size = await client.fetch_tree_size()
+            except Exception:
+                return None
+            state = self._state.get(client.log_meta.url)
+            done = state.current_index if state else 0
+            return client.log_meta.url, max(size - 1 - done, 0)
+
+        results = await asyncio.gather(*[one(c) for c in self._clients])
+        return dict(r for r in results if r)
 
     def _should_include_log(self, url: str) -> bool:
         """Check if log URL should be included based on include/exclude filters."""
