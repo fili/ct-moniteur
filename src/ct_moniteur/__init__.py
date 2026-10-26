@@ -1553,6 +1553,8 @@ class CTMoniteur:
         proxies: Optional[List[str]] = None,
         extra_logs: Optional[List[Dict[str, str]]] = None,
         min_rate: Optional[float] = None,
+        retry_max: Optional[float] = None,
+        raw_batch_size: Optional[int] = None,
     ):
         """
         Initialize CT Moniteur.
@@ -1578,12 +1580,14 @@ class CTMoniteur:
             parse_workers: Number of threads for parallel certificate parsing (ignored in raw mode)
             log_prefix: Custom prefix for log messages (e.g. "fetcher")
             parallel_fetches: Number of parallel batch fetches per log (for raw mode)
-            proxies: HTTP proxy URLs to spread requests over, alongside the
-                direct connection (for logs that rate limit per source IP)
+            proxies: HTTP proxy URLs to spread requests over instead of
+                the direct connection (for logs that rate limit per IP)
             extra_logs: [{"url": ..., "type": "classic"|"tiled"}] to watch
                 even when missing from the log list (still subject to
                 include/exclude)
             min_rate: floor (req/s per egress IP) for learned rate limits
+            retry_max: cap (seconds) on the per-attempt 429 retry backoff
+            raw_batch_size: entries per range for classic logs in raw mode
         """
         if callback is None and raw_callback is None:
             raise ValueError("Either callback or raw_callback must be provided")
@@ -1603,6 +1607,7 @@ class CTMoniteur:
         self.parse_workers = parse_workers
         self.log_prefix = log_prefix
         self.parallel_fetches = parallel_fetches
+        self.raw_batch_size = raw_batch_size
         self.extra_logs = extra_logs or []
 
         # Parse initial state into LogState objects
@@ -1615,7 +1620,10 @@ class CTMoniteur:
         self._running = False
         self._stats = MoniteurStats()
         self._state_lock = asyncio.Lock()
-        egress = [None] + list(proxies or [])
+        # The direct IP is shared by every fetcher on the host, so its
+        # per-IP quota is the one most likely spent; proxied fetchers
+        # skip it.
+        egress = list(proxies) if proxies else [None]
         transports = [
             RateLimitedTransport(
                 max_connections=max_connections,
@@ -1623,6 +1631,7 @@ class CTMoniteur:
                 shard_id=shard_id,
                 proxy=proxy,
                 **({"min_rate": min_rate} if min_rate else {}),
+                **({"retry_max": retry_max} if retry_max else {}),
             )
             for proxy in egress
         ]
@@ -1844,6 +1853,12 @@ class CTMoniteur:
                         log_prefix=self.log_prefix,
                         parallel_fetches=self.parallel_fetches,
                     )
+                    # A range is fetched one page after another and a
+                    # batch waits on its slowest range. On slow, lossy
+                    # logs (TrustAsia: 1-13s, ~50% 429) one-page ranges
+                    # keep that wait to a single request.
+                    if self.raw_batch_size:
+                        client.RAW_BATCH_SIZE = self.raw_batch_size
                 else:
                     client = TiledLogClient(
                         log_meta=log_meta,

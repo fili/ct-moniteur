@@ -21,6 +21,9 @@ class HostData:
     last_request_time: float = 0.0
     last_reduced: float = 0.0
     last_raised: float = 0.0
+    window_start: float = 0.0
+    window_requests: int = 0
+    window_429s: int = 0
 
 
 # A burst of parallel requests gets a burst of 429s for the same overload;
@@ -39,6 +42,12 @@ RATE_DECREASE = 0.7
 RETRY_BASE = 0.5
 RETRY_MAX = 60.0
 MIN_RATE = 1.0
+# Google and TrustAsia return a stray 429 now and then at any rate. Cutting
+# on each one (and re-learning the limit as half the rate just seen) held
+# fetchers at ~1 req/s per IP while a fresh IP took 80 req/s without a 429.
+# Only a window with sustained loss counts as being over the limit.
+LOSS_MIN_429S = 5
+LOSS_THRESHOLD = 0.05
 
 
 class RateLimitedTransport(httpx.AsyncHTTPTransport):
@@ -50,6 +59,7 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
         max_keepalive_connections: int = 20,
         shard_id: Optional[int] = None,
         min_rate: float = MIN_RATE,
+        retry_max: float = RETRY_MAX,
         **kwargs
     ):
         super().__init__(
@@ -65,6 +75,10 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
         # 0.3 req/s from idle IPs) drive any limiter to the floor without
         # reducing their 429s, so such fetchers set a higher floor.
         self._min_rate = min_rate
+        # Exponential backoff suits a server that is overloaded by us. For
+        # random shedding it only adds waits: each 1000-entry range is 32
+        # sequential requests and a batch waits on its slowest range.
+        self._retry_max = retry_max
         self._shard_prefix = f"shard{shard_id}:" if shard_id is not None else ""
         # Limits are per egress IP, so say which one a message is about
         if kwargs.get("proxy"):
@@ -112,6 +126,12 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                 else:
                     host_data.last_request_time = time.monotonic()
 
+                if now - host_data.window_start >= REDUCE_WINDOW:
+                    host_data.window_start = now
+                    host_data.window_requests = 0
+                    host_data.window_429s = 0
+                host_data.window_requests += 1
+
                 if host_data.first_request_time is None:
                     host_data.first_request_time = time.monotonic()
                 host_data.request_count += 1
@@ -140,45 +160,36 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                 host_data = self._get_host_data(host)
                 async with host_data.lock:
                     now = time.monotonic()
-                    recently_reduced = (
-                        host_data.rate_limit is not None
-                        and now - host_data.last_reduced < REDUCE_WINDOW
+                    host_data.window_429s += 1
+                    age = now - host_data.window_start
+                    overloaded = (
+                        now - host_data.last_reduced >= REDUCE_WINDOW
+                        and host_data.window_429s >= LOSS_MIN_429S
+                        and host_data.window_429s
+                        > LOSS_THRESHOLD * host_data.window_requests
+                        and age > 0
                     )
-                    if recently_reduced:
-                        default_retry_after = min(
-                            1.0 / host_data.rate_limit, 10.0
-                        )
-                    elif host_data.first_request_time:
-                        elapsed = time.monotonic() - host_data.first_request_time
-                        if elapsed > 0 and host_data.request_count > 1:
-                            # Use 50% of observed rate as safety margin
-                            raw_rate = (host_data.request_count - 1) / elapsed
-                            host_data.rate_limit = max(raw_rate * 0.5, self._min_rate)
-                            host_data.last_reduced = now
-                            logger.warning(
-                                f"{int(time.time())}:{self._shard_prefix}[{host}] "
-                                f"Rate limit learned: {host_data.rate_limit:.2f} req/s "
-                                f"(raw: {raw_rate:.2f})"
-                            )
-                            default_retry_after = min(1.0 / host_data.rate_limit, 10.0)
-                        else:
-                            default_retry_after = 5.0
-                    elif host_data.rate_limit is not None:
-                        # Already rate limited but still got 429 - halve the rate
+                    if overloaded:
+                        # The window rate, not the limit: an unused high
+                        # limit says nothing about what the server takes.
+                        seen = host_data.window_requests / age
+                        if host_data.rate_limit is not None:
+                            seen = min(seen, host_data.rate_limit)
                         host_data.rate_limit = max(
-                            host_data.rate_limit * RATE_DECREASE, self._min_rate
+                            seen * RATE_DECREASE, self._min_rate
                         )
                         host_data.last_reduced = now
                         logger.warning(
                             f"{int(time.time())}:{self._shard_prefix}[{host}] "
-                            f"Rate limit reduced to: {host_data.rate_limit:.2f} req/s"
+                            f"Rate limit reduced to: "
+                            f"{host_data.rate_limit:.2f} req/s "
+                            f"({host_data.window_429s}/"
+                            f"{host_data.window_requests} 429s in {age:.0f}s)"
                         )
-                        default_retry_after = min(1.0 / host_data.rate_limit, 10.0)
-                    else:
-                        default_retry_after = 5.0
-
-                    host_data.first_request_time = None
-                    host_data.request_count = 0
+                    default_retry_after = (
+                        min(1.0 / host_data.rate_limit, 10.0)
+                        if host_data.rate_limit else RETRY_BASE
+                    )
 
                     retry_after = response.headers.get("Retry-After", default_retry_after)
                     try:
@@ -187,7 +198,7 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                         wait_time = default_retry_after
                     wait_time = max(
                         wait_time,
-                        min(RETRY_BASE * 2 ** (attempt - 1), RETRY_MAX),
+                        min(RETRY_BASE * 2 ** (attempt - 1), self._retry_max),
                     )
 
                     if attempt > 1:
@@ -200,7 +211,10 @@ class RateLimitedTransport(httpx.AsyncHTTPTransport):
                             f"{int(time.time())}:{self._shard_prefix}[{host}] Rate limited (429): "
                             f"attempt {attempt}, retrying after {wait_time}s"
                         )
-                    await asyncio.sleep(wait_time)
+                # Sleeping under the lock stalled every request to this
+                # host for each 429's retry wait (~1 req/s per IP at
+                # TrustAsia's ~50% 429s).
+                await asyncio.sleep(wait_time)
             else:
                 return response
 
